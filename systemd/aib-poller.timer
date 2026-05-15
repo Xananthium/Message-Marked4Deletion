@@ -1,0 +1,11 @@
+[Unit]
+Description=Agent in a Box poller timer (every 5 min)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=aib-poller.service
+
+[Install]
+WantedBy=timers.target

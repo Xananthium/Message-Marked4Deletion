@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Build-time tracking (local agentic cycle state, regenerated on demand)
+agentic/db/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Aider artifacts (created at runtime inside tmp rsync clones, occasionally stragglers)
+.aider*
+.aib-msg.txt
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local logs
+*.log

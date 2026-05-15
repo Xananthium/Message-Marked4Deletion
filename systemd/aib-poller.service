@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent in a Box poller (one-shot)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=discnxt
+Group=discnxt
+WorkingDirectory=/home/discnxt/aib
+EnvironmentFile=/home/discnxt/aib/.env
+Environment=PATH=/home/discnxt/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/discnxt/aib/poller.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aib-poller

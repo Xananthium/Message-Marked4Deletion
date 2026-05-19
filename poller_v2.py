@@ -23,10 +23,12 @@ NOT invoked.
 """
 
 import os
+import re
 import sys
 import dataclasses
 import json
 import logging
+from typing import Optional
 
 import psycopg
 
@@ -51,26 +53,27 @@ from poller import (  # noqa: E402  (v1 helpers)
 log = logging.getLogger("aib")
 
 # ---------------------------------------------------------------------------
-# Per-alias routing overrides
-# Mail addressed to JESTER_MAILBOX goes directly to HOLLIS; all other mail
-# falls through to the default assignee (Mercer via env).
+# Routing: To: / Delivered-To: header -> agents.email_alias
+# Mercer is no longer a default; if no alias matches, the issue stays
+# unassigned (team@ catch-all queue).
 # ---------------------------------------------------------------------------
 
-_JESTER_MAILBOX = "jester@digitaldisconnections.com"
-_HOLLIS_AGENT_ID = "66133a39-6dde-4a11-86c1-3e1846d447d1"
 
-
-def _resolve_assignee(msg: dict, default: str | None) -> str | None:
-    """Return the agent UUID that should own a newly created issue.
-
-    Checks the 'to' field (populated from Delivered-To/To headers) against
-    known alias overrides.  Falls back to *default* for all other mail.
-    """
-    to_addr = (msg.get("to") or "").lower()
-    if _JESTER_MAILBOX in to_addr:
-        log.info("jester@ alias detected in To/Delivered-To — routing to Hollis")
-        return _HOLLIS_AGENT_ID
-    return default
+def match_agent_by_to_header(conn, message) -> Optional[str]:
+    """Look at To: / Delivered-To: headers, lowercase, match against agents.email_alias.
+    Returns the agent UUID string if a match, else None."""
+    addrs = []
+    for hdr in ('To', 'Delivered-To', 'X-Original-To'):
+        v = message.get(hdr, '')
+        # crude bare-email extraction; the poller already imports email.utils elsewhere
+        for piece in re.findall(r'[\w.+-]+@[\w.-]+', v):
+            addrs.append(piece.lower())
+    if not addrs:
+        return None
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM agents WHERE LOWER(email_alias) = ANY(%s) LIMIT 1", (addrs,))
+        row = cur.fetchone()
+        return str(row[0]) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -135,28 +138,9 @@ def lookup_customer(pc_conn: psycopg.Connection, sender_email: str, mailbox: str
 
 
 def find_issue_by_thread(pc_conn: psycopg.Connection, company_id: str, thread_id: str) -> str | None:
-    """Return issue.id (uuid as text) for an issue (any non-cancelled status) whose
-    first comment metadata.gmail_thread_id matches; else None.
-    Returns the most-recent matching issue if multiple share a thread."""
-    if not thread_id:
-        return None
-    with pc_conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT i.id::text
-            FROM issue_comments ic
-            JOIN issues i ON i.id = ic.issue_id
-            WHERE ic.company_id = %s
-              AND ic.metadata->>'gmail_thread_id' = %s
-              AND i.status NOT IN ('cancelled')
-              AND i.hidden_at IS NULL
-            ORDER BY i.created_at DESC
-            LIMIT 1
-            """,
-            (company_id, thread_id),
-        )
-        row = cur.fetchone()
-    return row[0] if row else None
+    """OPERATOR-LOCKED 2026-05-19: new email = new issue. thread_id kept on issue metadata
+    for UI grouping only. This function returns None to disable reattach."""
+    return None
 
 
 def append_comment(
@@ -366,7 +350,10 @@ def process_message(
         }
 
     # No existing thread -> new issue.
-    assignee = _resolve_assignee(msg, email_assignee_agent_id)
+    # Route by To: header against agents.email_alias; no Mercer default.
+    # email_assignee_agent_id is intentionally ignored — operator-locked
+    # 2026-05-19: alias-only routing, unmatched mail stays unassigned.
+    assignee = match_agent_by_to_header(pc_conn, msg)
     issue_id, identifier = create_issue_for_email(
         pc_conn, company_id, customer, msg,
         assignee_agent_id=assignee,
@@ -401,7 +388,11 @@ def main() -> int:
     cfg = load_config()
     pc_dsn, company_id, email_assignee = load_paperclip_env()
     if email_assignee:
-        log.info("new customer_email issues will be assigned to agent %s", email_assignee)
+        log.warning(
+            "PAPERCLIP_EMAIL_ASSIGNEE_AGENT_ID=%s is set but IGNORED — "
+            "alias routing replaced default assignment 2026-05-19",
+            email_assignee,
+        )
 
     with psycopg.connect(cfg.dsn) as pending_conn, psycopg.connect(pc_dsn) as pc_conn:
         svc = gmail_client(cfg.sa_path, cfg.mailbox)

@@ -1,0 +1,16 @@
+[Unit]
+Description=discnxt uptime check (one-shot)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=discnxt
+Group=discnxt
+WorkingDirectory=/home/discnxt/aib
+Environment=PATH=/home/discnxt/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PAPERCLIP_DSN=postgres://paperclip:3f99b0afdbedc68b2a60c3bd4c9cc2af753d6a0cacf1a730@127.0.0.1:5432/paperclip
+ExecStart=/usr/bin/python3 /home/discnxt/aib/cron/uptime-check.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discnxt-uptime-check

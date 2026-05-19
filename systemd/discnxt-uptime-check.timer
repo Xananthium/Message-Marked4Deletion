@@ -1,0 +1,12 @@
+[Unit]
+Description=discnxt uptime check timer (every 10 min)
+# DO NOT enable until operator authorizes: systemctl enable --now discnxt-uptime-check.timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=discnxt-uptime-check.service
+
+[Install]
+WantedBy=timers.target

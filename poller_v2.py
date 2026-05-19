@@ -135,8 +135,9 @@ def lookup_customer(pc_conn: psycopg.Connection, sender_email: str, mailbox: str
 
 
 def find_issue_by_thread(pc_conn: psycopg.Connection, company_id: str, thread_id: str) -> str | None:
-    """Return issue.id (uuid as text) for an OPEN issue whose first comment
-    metadata.gmail_thread_id matches; else None."""
+    """Return issue.id (uuid as text) for an issue (any non-cancelled status) whose
+    first comment metadata.gmail_thread_id matches; else None.
+    Returns the most-recent matching issue if multiple share a thread."""
     if not thread_id:
         return None
     with pc_conn.cursor() as cur:
@@ -147,9 +148,9 @@ def find_issue_by_thread(pc_conn: psycopg.Connection, company_id: str, thread_id
             JOIN issues i ON i.id = ic.issue_id
             WHERE ic.company_id = %s
               AND ic.metadata->>'gmail_thread_id' = %s
-              AND i.status NOT IN ('done', 'cancelled')
+              AND i.status NOT IN ('cancelled')
               AND i.hidden_at IS NULL
-            ORDER BY ic.created_at ASC
+            ORDER BY i.created_at DESC
             LIMIT 1
             """,
             (company_id, thread_id),

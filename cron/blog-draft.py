@@ -72,8 +72,12 @@ def do_one(site, conn, writer_id):
             f"Weekly blog draft request for {fqdn}.\n\n"
             f"Week: {_ISO_WEEK}\n"
             f"Site context: /var/sites/{fqdn}/\n\n"
-            "Please produce a draft post and attach it to this issue. "
-            "Set status to awaiting_approval when done."
+            "Produce a draft post and attach it to this issue. If the site "
+            "has customer_email_for_blog_approval set, send the draft to the "
+            "customer and leave the issue at 'todo' so their reply pulls it "
+            "back; mark 'done' once the customer signs off. If no customer "
+            "review is configured, mark 'done' when the draft is final and "
+            "blog-publish will pick it up on the next publish day."
         )
         with conn.cursor() as cur:
             cur.execute("UPDATE companies SET issue_counter=issue_counter+1 "

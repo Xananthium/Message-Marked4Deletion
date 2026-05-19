@@ -3,10 +3,15 @@
 ALL outbound mail must ride through send(). Direct Gmail calls outside
 this module are forbidden for worker code.
 
+Agents decide and send. No approval workflow exists. The status defaults
+to 'in_progress' after sending; pass 'todo' if your reply ends with a
+question and you want the customer's reply to pull the issue back, or
+'done' if the thread is closed. Operator-in-the-loop happens by the
+operator being a participant in the email thread, not by a code gate.
+
 Public API:
     send(issue_id, subject, body, to=None,
-         status_after='awaiting_approval', requires_approval=True,
-         from_alias=None) -> str
+         status_after='in_progress', from_alias=None) -> str
 """
 from __future__ import annotations
 
@@ -63,24 +68,26 @@ def send(
     subject: str,
     body: str,
     to: str | None = None,
-    status_after: str = "awaiting_approval",
-    requires_approval: bool = True,
+    status_after: str = "in_progress",
     from_alias: str | None = None,
 ) -> str:
     """Send an outbound email linked to a Paperclip issue.
 
+    The agent decides what to send and sends it. No approval gate.
+
     Args:
-        issue_id:         Paperclip issue UUID this email belongs to.
-        subject:          Email subject line.
-        body:             Plain-text email body.
-        to:               Recipient address. Defaults to operator email.
-        status_after:     Issue status to set after sending.
-        requires_approval: When True, record in issue comments that human
-                           approval is required before acting on replies.
-        from_alias:       Optional per-agent send-as identity (e.g.
-                          'mercer@digitaldisconnections.com'). Must be a
-                          confirmed send-as alias on the authenticated
-                          mailbox. Defaults to the team mailbox.
+        issue_id:     Paperclip issue UUID this email belongs to.
+        subject:      Email subject line.
+        body:         Plain-text email body.
+        to:           Recipient address. Defaults to operator email.
+        status_after: Issue status to set after sending. Defaults to
+                      'in_progress'. Pass 'todo' if your reply ends with
+                      a question (so the customer's reply pulls it back)
+                      or 'done' if the thread is closed.
+        from_alias:   Optional per-agent send-as identity (e.g.
+                      'mercer@digitaldisconnections.com'). Must be a
+                      confirmed send-as alias on the authenticated
+                      mailbox. Defaults to the team mailbox.
 
     Returns:
         Gmail message ID of the sent message.
@@ -107,8 +114,7 @@ def send(
             """,
             (
                 issue_id,
-                f"[send_email] Sent to {recipient} | gmail_id={gmail_msg_id}"
-                + (" | requires_approval=true" if requires_approval else ""),
+                f"[send_email] Sent to {recipient} | gmail_id={gmail_msg_id}",
             ),
         )
         cur.execute(

@@ -4,9 +4,10 @@ WORKER:      blog-reminder
 CADENCE:     daily 09:00
 OPT-IN-KEY:  blog_enabled + outbound_prefs.customer_email_for_blog_approval set
 WHAT IT DOES:
-    For each opted-in site with a blog draft issue in awaiting_approval status
-    that is older than 48 hours, files a Mercer issue requesting a customer
-    reminder email ("your draft is waiting, please approve or send edits").
+    For each opted-in site with a blog draft issue still in 'todo' status
+    (i.e. sent to the customer, waiting on their reply) older than 48 hours,
+    files a Mercer issue requesting a customer reminder email ("your draft
+    is waiting, please approve or send edits").
     Idempotent: one open reminder issue per (fqdn, draft_issue_id).
 """
 from __future__ import annotations
@@ -48,7 +49,7 @@ def _stale_drafts(conn, fqdn) -> list[dict]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """SELECT id, created_at, origin_fingerprint FROM issues
-               WHERE company_id=%s AND status='awaiting_approval'
+               WHERE company_id=%s AND status='todo'
                  AND origin_fingerprint LIKE %s AND created_at < %s
                ORDER BY created_at DESC""",
             (_COMPANY_ID, f"blog-draft:{fqdn}:%", cutoff),
@@ -76,10 +77,10 @@ def do_one(site, conn):
             # File Mercer issue; Mercer will send the customer email
             age_h = int((datetime.now(timezone.utc) - draft["created_at"]).total_seconds() / 3600)
             body = (
-                f"Blog draft for {fqdn} has been awaiting approval for {age_h} hours.\n\n"
+                f"Blog draft for {fqdn} has been waiting on the customer for {age_h} hours.\n\n"
                 f"Draft issue: DIS reference — id {draft['id']}\n"
                 f"Customer email: {to}\n\n"
-                "Please send a polite reminder asking the customer to approve or send edits."
+                "Send a polite reminder asking the customer to approve or send edits."
             )
             with conn.cursor() as cur:
                 cur.execute("UPDATE companies SET issue_counter=issue_counter+1 "

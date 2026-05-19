@@ -47,15 +47,23 @@ def _opted_in_sites(conn) -> list[dict]:
 
 
 def _approved_draft(conn, fqdn) -> dict | None:
-    """Return newest awaiting_approval issue for this site's blog, or None."""
+    """Return newest done draft issue for this site's blog that hasn't been
+    published yet (origin_fingerprint not in any blog-publish:<fqdn>:* row)."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """SELECT i.id, i.description, i.origin_fingerprint
                FROM issues i
                WHERE i.company_id=%s
-                 AND i.status='awaiting_approval'
+                 AND i.status='done'
                  AND i.origin_fingerprint LIKE %s
-               ORDER BY i.created_at DESC LIMIT 1""",
+                 AND NOT EXISTS (
+                     SELECT 1 FROM issues p
+                     WHERE p.company_id=i.company_id
+                       AND p.origin_fingerprint = 'blog-publish:' ||
+                           substring(i.origin_fingerprint from 'blog-draft:(.*)')
+                 )
+               ORDER BY i.completed_at DESC NULLS LAST, i.updated_at DESC
+               LIMIT 1""",
             (_COMPANY_ID, f"blog-draft:{fqdn}:%"),
         )
         row = cur.fetchone()

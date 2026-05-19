@@ -5,7 +5,8 @@ this module are forbidden for worker code.
 
 Public API:
     send(issue_id, subject, body, to=None,
-         status_after='awaiting_approval', requires_approval=True) -> str
+         status_after='awaiting_approval', requires_approval=True,
+         from_alias=None) -> str
 """
 from __future__ import annotations
 
@@ -47,10 +48,12 @@ def _gmail_svc():
     return poller.gmail_client(_SA_PATH, _MAILBOX)
 
 
-def _build_raw(subject: str, body: str, to: str, from_addr: str) -> str:
+def _build_raw(
+    subject: str, body: str, to: str, from_addr: str, from_alias: str | None = None
+) -> str:
     msg = email.mime.text.MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
-    msg["From"] = from_addr
+    msg["From"] = from_alias or from_addr
     msg["To"] = to
     return base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")
 
@@ -62,6 +65,7 @@ def send(
     to: str | None = None,
     status_after: str = "awaiting_approval",
     requires_approval: bool = True,
+    from_alias: str | None = None,
 ) -> str:
     """Send an outbound email linked to a Paperclip issue.
 
@@ -73,6 +77,10 @@ def send(
         status_after:     Issue status to set after sending.
         requires_approval: When True, record in issue comments that human
                            approval is required before acting on replies.
+        from_alias:       Optional per-agent send-as identity (e.g.
+                          'mercer@digitaldisconnections.com'). Must be a
+                          confirmed send-as alias on the authenticated
+                          mailbox. Defaults to the team mailbox.
 
     Returns:
         Gmail message ID of the sent message.
@@ -83,7 +91,7 @@ def send(
     recipient = to or _OPERATOR_EMAIL
 
     svc = _gmail_svc()
-    raw = _build_raw(subject, body, recipient, _MAILBOX)
+    raw = _build_raw(subject, body, recipient, _MAILBOX, from_alias)
     result = svc.users().messages().send(
         userId=_MAILBOX, body={"raw": raw}
     ).execute()

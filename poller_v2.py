@@ -52,10 +52,15 @@ from poller import (  # noqa: E402  (v1 helpers)
 
 log = logging.getLogger("aib")
 
+# Mercer is the triager fallback per the operator-locked routing model
+# (2026-05-19): if no agent alias matches the To: header, the issue is
+# assigned to her and she routes or owns it. If she can't decide, she
+# escalates to Paulina. No more unassigned team@ queue.
+MERCER_AGENT_ID = "cfaac33f-c89a-43d6-95dd-2a9587d1d69d"
+
 # ---------------------------------------------------------------------------
 # Routing: To: / Delivered-To: header -> agents.email_alias
-# Mercer is no longer a default; if no alias matches, the issue stays
-# unassigned (team@ catch-all queue).
+# No alias match -> defaults to Mercer at the call site.
 # ---------------------------------------------------------------------------
 
 
@@ -350,10 +355,10 @@ def process_message(
         }
 
     # No existing thread -> new issue.
-    # Route by To: header against agents.email_alias; no Mercer default.
-    # email_assignee_agent_id is intentionally ignored — operator-locked
-    # 2026-05-19: alias-only routing, unmatched mail stays unassigned.
-    assignee = match_agent_by_to_header(pc_conn, msg)
+    # Route by To: header against agents.email_alias; no alias match
+    # defaults to Mercer for triage (operator-locked 2026-05-19).
+    # email_assignee_agent_id is intentionally ignored.
+    assignee = match_agent_by_to_header(pc_conn, msg) or MERCER_AGENT_ID
     issue_id, identifier = create_issue_for_email(
         pc_conn, company_id, customer, msg,
         assignee_agent_id=assignee,

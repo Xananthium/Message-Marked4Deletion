@@ -1,0 +1,16 @@
+[Unit]
+Description=Discnxt nightly Postgres backup (paperclip DB)
+Wants=postgresql.service
+After=postgresql.service network-online.target
+
+[Service]
+Type=oneshot
+User=discnxt
+Group=discnxt
+ExecStart=/home/discnxt/aib/backup-postgres.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# Don't fail the timer if pg_dump fails — we still want subsequent attempts.
+# The script logs the failure to /var/log/discnxt-backup.log.
+SuccessExitStatus=1

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Postgres backup (03:00 local)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=discnxt-backup.service
+
+[Install]
+WantedBy=timers.target

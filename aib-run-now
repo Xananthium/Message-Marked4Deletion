@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# aib-run-now — manually trigger the AIB poller once
+set -euo pipefail
+
+echo "Starting manual poller run..."
+sudo systemctl start aib-poller.service
+
+echo "Waiting for completion..."
+sleep 2
+
+echo "=== Last 10 lines of poller logs ==="
+journalctl -u aib-poller.service -n 10 --no-pager
+
+echo -e "\n=== Checking exit status ==="
+if systemctl is-failed aib-poller.service >/dev/null 2>&1; then
+    echo "❌ Poller failed"
+    journalctl -u aib-poller.service -n 20 --no-pager --output=short-precise
+    exit 1
+else
+    echo "✅ Poller completed successfully"
+fi

@@ -13,5 +13,10 @@ CREATE TABLE IF NOT EXISTS pending_emails (
     sender       TEXT,
     subject      TEXT,
     reason       TEXT,
+    retry_count  INTEGER DEFAULT 0,
+    next_retry   TIMESTAMPTZ DEFAULT now(),
     created_at   TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS pending_emails_next_retry_idx
+    ON pending_emails (next_retry) WHERE retry_count < 5;

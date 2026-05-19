@@ -1,0 +1,24 @@
+[Unit]
+Description=discnxt.com contact-form endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discnxt
+Group=discnxt
+WorkingDirectory=/home/discnxt/aib
+ExecStart=/usr/bin/python3 /home/discnxt/aib/contact-form.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# minimal hardening; needs sendmail at /usr/sbin/sendmail so don't lock fs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/discnxt/aib
+
+[Install]
+WantedBy=multi-user.target

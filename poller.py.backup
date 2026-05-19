@@ -150,7 +150,6 @@ def fetch_message(svc, mailbox: str, msg_id: str) -> dict:
         "id": msg_id,
         "thread_id": raw.get("threadId", ""),
         "from": headers.get("From", ""),
-        "to": headers.get("Delivered-To", headers.get("To", "")),
         "subject": headers.get("Subject", ""),
         "body": body,
         "message_id_hdr": headers.get("Message-ID", ""),

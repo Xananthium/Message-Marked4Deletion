@@ -1,0 +1,12 @@
+# logrotate config for /var/log/discnxt-provision.log
+# Install with:  sudo cp /home/discnxt/aib/provision-site.logrotate /etc/logrotate.d/discnxt-provision
+/var/log/discnxt-provision.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 discnxt discnxt
+    su discnxt discnxt
+}

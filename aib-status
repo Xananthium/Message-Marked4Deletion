@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# aib-status — quick view of AIB state
+set -euo pipefail
+
+ENV_FILE="$(dirname "$(realpath "$0")")/.env"
+[[ -f "$ENV_FILE" ]] || { echo "Error: .env not found at $ENV_FILE" >&2; exit 1; }
+source "$ENV_FILE"
+
+show_usage() {
+    cat <<EOF
+Usage: aib-status [OPTIONS]
+
+Options:
+  --sites          List active customer sites
+  --pending        Show recent pending_emails failures
+  --logs [N]       Tail poller logs (default 5 lines)
+  --help           Show this help
+
+With no options, shows summary of all statuses.
+EOF
+}
+
+show_sites() {
+    psql "$AIB_DSN" -c "SELECT customer_email, domain, status, created_at FROM customer_sites ORDER BY created_at DESC;" 2>/dev/null || {
+        echo "Failed to query database. Is PostgreSQL running?" >&2
+        exit 1
+    }
+}
+
+show_pending() {
+    psql "$AIB_DSN" -c "SELECT id, sender, subject, reason, created_at FROM pending_emails ORDER BY created_at DESC LIMIT 20;" 2>/dev/null || {
+        echo "Failed to query database. Is PostgreSQL running?" >&2
+        exit 1
+    }
+}
+
+show_logs() {
+    local lines="${1:-5}"
+    journalctl -u aib-poller.service -n "$lines" -f --no-tail 2>/dev/null || {
+        echo "Could not read journal logs. Ensure journald is accessible." >&2
+    }
+}
+
+show_summary() {
+    echo "=== AIB Status Summary ==="
+    echo
+
+    echo "Active customer sites:"
+    psql "$AIB_DSN" -t -c "SELECT COUNT(*) FROM customer_sites WHERE status = 'active';" 2>/dev/null || echo "  (database unavailable)"
+
+    echo -e "\nRecent pending emails (last 24h):"
+    psql "$AIB_DSN" -t -c "SELECT COUNT(*) FROM pending_emails WHERE created_at > NOW() - INTERVAL '24 hours';" 2>/dev/null || echo "  (database unavailable)"
+
+    echo -e "\nSystemd timer status:"
+    systemctl is-active aib-poller.timer >/dev/null 2>&1 && echo "  ✅ aib-poller.timer: active" || echo "  ❌ aib-poller.timer: inactive"
+    systemctl is-enabled aib-poller.timer >/dev/null 2>&1 && echo "  ✅ aib-poller.timer: enabled" || echo "  ❌ aib-poller.timer: disabled"
+
+    echo -e "\nLast poller run:"
+    journalctl -u aib-poller.service -n 1 --no-pager --quiet --output=short-iso 2>/dev/null | head -1 || echo "  (no logs found)"
+}
+
+main() {
+    if [[ $# -eq 0 ]]; then
+        show_summary
+        exit 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --sites)
+                show_sites
+                shift
+                ;;
+            --pending)
+                show_pending
+                shift
+                ;;
+            --logs)
+                shift
+                if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then
+                    show_logs "$1"
+                    shift
+                else
+                    show_logs 5
+                fi
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+main "$@"

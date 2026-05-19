@@ -1,3 +1,4 @@
 google-api-python-client
 psycopg[binary]
 aider-chat
+google-cloud-secret-manager

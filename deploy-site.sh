@@ -17,9 +17,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-CONTABO_USER="${CONTABO_USER:-cass}"
-CONTABO_HOST="${CONTABO_HOST:-185.190.143.137}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+CONTABO_HOST="${CONTABO_HOST:-contabo}"
 SITES_ROOT="${SITES_ROOT:-/var/sites}"
 REMOTE_WWW_ROOT="${REMOTE_WWW_ROOT:-/var/www}"
 LOCAL_CADDYFILE="${LOCAL_CADDYFILE:-/home/discnxt/aib/Caddyfile}"   # optional
@@ -86,7 +84,7 @@ fi
 _init_audit_log
 
 SRC="$SITES_ROOT/$DOMAIN/public/"
-DEST="$CONTABO_USER@$CONTABO_HOST:$REMOTE_WWW_ROOT/$DOMAIN/"
+DEST="$CONTABO_HOST:$REMOTE_WWW_ROOT/$DOMAIN/"
 
 if [[ ! -d "$SRC" ]]; then
   audit "src_missing" 2 "no_directory $SRC"
@@ -94,7 +92,7 @@ if [[ ! -d "$SRC" ]]; then
   exit 2
 fi
 
-SSH_CMD="ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new"
+SSH_CMD="ssh -o StrictHostKeyChecking=accept-new"
 
 # Stamp deploy time into the source tree so the live status page reads the
 # moment-we-shipped value out of /last-deploy.txt. Skip on dry-run.
@@ -133,11 +131,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Step 1.5: GSC sitemap + indexing (non-fatal)
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" != "true" ]]; then
+  echo "==> Notifying GSC (sitemap + indexing)..."
+  if python3 -m lib.gsc sitemap "$DOMAIN" > /dev/null 2>&1; then
+    audit "gsc_sitemap_ok" 0 "domain=$DOMAIN"
+    python3 -m lib.gsc index "$DOMAIN" > /dev/null 2>&1 && \
+      audit "gsc_index_ok" 0 "domain=$DOMAIN" || \
+      audit "gsc_index_skipped" 0 "indexing API may not be enabled"
+  else
+    audit "gsc_skipped" 0 "domain=$DOMAIN not verified in GSC (will retry)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Step 2: Caddy reload (only if local Caddyfile changed)
 # ---------------------------------------------------------------------------
 if [[ -f "$LOCAL_CADDYFILE" ]]; then
   LOCAL_HASH=$(sha256sum "$LOCAL_CADDYFILE" | awk '{print $1}')
-  REMOTE_HASH=$($SSH_CMD "$CONTABO_USER@$CONTABO_HOST" 'sudo sha256sum /etc/caddy/Caddyfile 2>/dev/null | awk "{print \$1}"' || echo "")
+  REMOTE_HASH=$($SSH_CMD "$CONTABO_HOST" 'sudo sha256sum /etc/caddy/Caddyfile 2>/dev/null | awk "{print \$1}"' || echo "")
 
   if [[ -z "$REMOTE_HASH" ]]; then
     audit "caddy_hash_unreadable" 0 "could_not_read_remote_caddyfile"
@@ -148,12 +161,12 @@ if [[ -f "$LOCAL_CADDYFILE" ]]; then
   else
     echo "==> Caddyfile differs (local=$LOCAL_HASH remote=$REMOTE_HASH); deploying + reloading"
     if [[ "$DRY_RUN" == "true" ]]; then
-      echo "==> [dry-run] would scp $LOCAL_CADDYFILE -> $CONTABO_USER@$CONTABO_HOST:/etc/caddy/Caddyfile"
+      echo "==> [dry-run] would scp $LOCAL_CADDYFILE -> $CONTABO_HOST:/etc/caddy/Caddyfile"
       echo "==> [dry-run] would: sudo caddy reload --config /etc/caddy/Caddyfile"
       audit "caddy_reload_dryrun" 0 "would_copy_and_reload"
     else
-      scp -i "$SSH_KEY" "$LOCAL_CADDYFILE" "$CONTABO_USER@$CONTABO_HOST:/tmp/Caddyfile.new"
-      $SSH_CMD "$CONTABO_USER@$CONTABO_HOST" \
+      scp -o StrictHostKeyChecking=accept-new "$LOCAL_CADDYFILE" "$CONTABO_HOST:/tmp/Caddyfile.new"
+      $SSH_CMD "$CONTABO_HOST" \
         'sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo caddy reload --config /etc/caddy/Caddyfile && rm -f /tmp/Caddyfile.new'
       audit "caddy_reloaded" 0 "new_hash=$LOCAL_HASH"
       echo "==> Caddy reloaded."
@@ -161,6 +174,33 @@ if [[ -f "$LOCAL_CADDYFILE" ]]; then
   fi
 else
   audit "caddy_no_local" 0 "no_local_caddyfile_to_compare"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3: GSC — submit sitemap + request indexing
+# ---------------------------------------------------------------------------
+GSC_SCRIPT="$(dirname "$(realpath "$0")")/lib/gsc.py"
+if [[ "$DRY_RUN" != "true" && -f "$GSC_SCRIPT" ]]; then
+  echo "==> Submitting sitemap to GSC..."
+  if python3 -m lib.gsc sitemap "$DOMAIN" > /dev/null 2>&1; then
+    audit "gsc_sitemap_ok" 0 "$DOMAIN"
+    echo "==> GSC sitemap submitted."
+  else
+    audit "gsc_sitemap_skip" 0 "not yet verified in GSC"
+    echo "==> GSC sitemap skipped (domain not yet verified in GSC)"
+  fi
+
+  echo "==> Requesting indexing..."
+  if python3 -m lib.gsc index "$DOMAIN" > /dev/null 2>&1; then
+    audit "gsc_index_ok" 0 "$DOMAIN"
+    echo "==> Indexing request sent."
+  else
+    audit "gsc_index_skip" 0 "indexing API unavailable"
+    echo "==> Indexing request skipped."
+  fi
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "==> [dry-run] would submit sitemap + request indexing to GSC"
+  audit "gsc_dryrun" 0 "would_submit_sitemap_and_index"
 fi
 
 # ---------------------------------------------------------------------------

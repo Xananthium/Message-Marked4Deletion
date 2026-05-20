@@ -112,14 +112,18 @@ esac
 
 ENV_FILE="$(dirname "$(realpath "$0")")/.env"
 NAMECHEAP_SECRETS="$HOME/.secrets/namecheap.env.enc.env"
+PAPERCLIP_SECRETS="$HOME/.secrets/paperclip-poller-api.env"
 [[ -f "$ENV_FILE" ]] || { echo "Error: .env not found at $ENV_FILE" >&2; log_event "config_error" 1 ".env missing"; exit 1; }
 [[ -f "$NAMECHEAP_SECRETS" ]] || { echo "Error: Namecheap secrets not found at $NAMECHEAP_SECRETS" >&2; log_event "config_error" 1 "namecheap secrets missing"; exit 1; }
+[[ -f "$PAPERCLIP_SECRETS" ]] || { echo "Error: Paperclip secrets not found at $PAPERCLIP_SECRETS" >&2; log_event "config_error" 1 "paperclip secrets missing"; exit 1; }
 # shellcheck source=/dev/null
 set -a
 # shellcheck source=/dev/null
 source "$ENV_FILE"
 # shellcheck source=/dev/null
 source <("$HOME/.secrets/bin/secret-source" "$NAMECHEAP_SECRETS")
+# shellcheck source=/dev/null
+source "$PAPERCLIP_SECRETS"
 set +a
 
 : "${AIB_SSH_ALIAS:?AIB_SSH_ALIAS missing in .env}"
@@ -130,6 +134,7 @@ set +a
 : "${NAMECHEAP_CLIENT_IP:?NAMECHEAP_CLIENT_IP missing in .env}"
 : "${AIB_DSN:?AIB_DSN missing in .env}"
 : "${AIB_OPERATOR_EMAIL:?AIB_OPERATOR_EMAIL missing in .env}"
+: "${PAPERCLIP_DSN:?PAPERCLIP_DSN missing in secrets}"
 AIDER_MODEL="${AIDER_MODEL:-ollama_chat/kimi-k2.6:cloud}"
 
 SLD="$(echo "$DOMAIN" | awk -F. '{print $(NF-1)}')"
@@ -137,7 +142,7 @@ TLD="$(echo "$DOMAIN" | awk -F. '{print $NF}')"
 TMPDIR_NC="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_NC"; _rc=$?; log_event "exit" "$_rc" ""; exit $_rc' EXIT
 
-echo "==> [1/5] Initialising site dir on Contabo..."
+echo "==> [1/6] Initialising site dir on Contabo..."
 log_event "contabo_init_start" 0 "/var/www/$DOMAIN"
 # SC2029: $DOMAIN intentionally expands locally before ssh
 # shellcheck disable=SC2029
@@ -153,7 +158,7 @@ else
   rc=$?; log_event "contabo_init_failed" "$rc" ""; exit $rc
 fi
 
-echo "==> [2/5] Ensuring Caddy block..."
+echo "==> [2/6] Ensuring Caddy block..."
 log_event "caddy_block_start" 0 ""
 # shellcheck disable=SC2029
 if ssh "$AIB_SSH_ALIAS" "
@@ -166,32 +171,74 @@ else
   rc=$?; log_event "caddy_block_failed" "$rc" ""; exit $rc
 fi
 
-echo "==> [3/5] Setting Namecheap DNS (A + MX)..."
+echo "==> [3/8] Getting GSC verification token..."
+log_event "gsc_token_start" 0 "$DOMAIN"
+GSC_TXT=""
+if GSC_TOKEN=$(python3 -m lib.gsc verify "$DOMAIN" 2>/dev/null); then
+  if [[ "$GSC_TOKEN" != "ALREADY_VERIFIED" ]]; then
+    GSC_TXT="$GSC_TOKEN"
+    log_event "gsc_token_ok" 0 "token=${GSC_TXT:0:20}..."
+  else
+    log_event "gsc_already_verified" 0 "$DOMAIN"
+  fi
+else
+  log_event "gsc_token_skipped" 0 "SA may not be GSC owner yet"
+fi
+
+echo "==> [4/8] Setting Namecheap DNS (A + MX + GSC TXT)..."
 log_event "namecheap_dns_start" 0 "SLD=$SLD TLD=$TLD A=$CONTABO_IP"
-curl -s "https://api.namecheap.com/xml.response" \
-  --data-urlencode "ApiUser=$NAMECHEAP_API_USER" \
-  --data-urlencode "ApiKey=$NAMECHEAP_API_KEY" \
-  --data-urlencode "UserName=$NAMECHEAP_USERNAME" \
-  --data-urlencode "ClientIp=$NAMECHEAP_CLIENT_IP" \
-  --data-urlencode "Command=namecheap.domains.dns.setHosts" \
-  --data-urlencode "SLD=$SLD" \
-  --data-urlencode "TLD=$TLD" \
-  --data-urlencode "HostName1=@"  --data-urlencode "RecordType1=A" \
-  --data-urlencode "Address1=$CONTABO_IP" --data-urlencode "TTL1=300" \
-  --data-urlencode "HostName2=@"  --data-urlencode "RecordType2=MX" \
-  --data-urlencode "Address2=mx1-hosting.jellyfish.systems" \
-  --data-urlencode "MXPref2=10"   --data-urlencode "TTL2=1800" \
-  --data-urlencode "HostName3=@"  --data-urlencode "RecordType3=MX" \
-  --data-urlencode "Address3=mx2-hosting.jellyfish.systems" \
-  --data-urlencode "MXPref3=20"   --data-urlencode "TTL3=1800" \
-  -o "$TMPDIR_NC/sethosts.xml"
+NC_CURL_ARGS=(
+  -s "https://api.namecheap.com/xml.response"
+  --data-urlencode "ApiUser=$NAMECHEAP_API_USER"
+  --data-urlencode "ApiKey=$NAMECHEAP_API_KEY"
+  --data-urlencode "UserName=$NAMECHEAP_USERNAME"
+  --data-urlencode "ClientIp=$NAMECHEAP_CLIENT_IP"
+  --data-urlencode "Command=namecheap.domains.dns.setHosts"
+  --data-urlencode "SLD=$SLD"
+  --data-urlencode "TLD=$TLD"
+  --data-urlencode "HostName1=@"  --data-urlencode "RecordType1=A"
+  --data-urlencode "Address1=$CONTABO_IP" --data-urlencode "TTL1=300"
+  --data-urlencode "HostName2=@"  --data-urlencode "RecordType2=MX"
+  --data-urlencode "Address2=mx1-hosting.jellyfish.systems"
+  --data-urlencode "MXPref2=10"   --data-urlencode "TTL2=1800"
+  --data-urlencode "HostName3=@"  --data-urlencode "RecordType3=MX"
+  --data-urlencode "Address3=mx2-hosting.jellyfish.systems"
+  --data-urlencode "MXPref3=20"   --data-urlencode "TTL3=1800"
+)
+if [[ -n "$GSC_TXT" ]]; then
+  NC_CURL_ARGS+=(
+    --data-urlencode "HostName4=@" --data-urlencode "RecordType4=TXT"
+    --data-urlencode "Address4=$GSC_TXT" --data-urlencode "TTL4=60"
+  )
+fi
+curl "${NC_CURL_ARGS[@]}" -o "$TMPDIR_NC/sethosts.xml"
 if grep -q '<Error ' "$TMPDIR_NC/sethosts.xml"; then
   echo "Error: Namecheap setHosts failed:" >&2; cat "$TMPDIR_NC/sethosts.xml" >&2
   log_event "namecheap_dns_failed" 1 "setHosts error"; exit 1
 fi
 log_event "namecheap_dns_ok" 0 ""
 
-echo "==> [3/5] Setting Namecheap email forwarding..."
+echo "==> [4b/8] Verifying domain in GSC..."
+if [[ -n "$GSC_TXT" ]]; then
+  log_event "gsc_verify_start" 0 "$DOMAIN"
+  echo "    (waiting 30s for DNS propagation...)"
+  sleep 30
+  if python3 -m lib.gsc verify-domain "$DOMAIN" > /dev/null 2>&1; then
+    log_event "gsc_verify_ok" 0 "$DOMAIN"
+    echo "==> [4c/8] Submitting sitemap to GSC..."
+    if python3 -m lib.gsc sitemap "$DOMAIN" > /dev/null 2>&1; then
+      log_event "gsc_sitemap_ok" 0 "$DOMAIN"
+    else
+      log_event "gsc_sitemap_skipped" 0 "sitemap submission failed (will retry on deploy)"
+    fi
+  else
+    log_event "gsc_verify_deferred" 0 "DNS may not have propagated; verify on next deploy"
+  fi
+else
+  log_event "gsc_verify_skipped" 0 "no GSC token (SA may not be GSC owner)"
+fi
+
+echo "==> [5/8] Setting Namecheap email forwarding..."
 log_event "namecheap_fwd_start" 0 "*@$DOMAIN -> $CUSTOMER_EMAIL"
 curl -s "https://api.namecheap.com/xml.response" \
   --data-urlencode "ApiUser=$NAMECHEAP_API_USER" \
@@ -209,7 +256,7 @@ if grep -q '<Error ' "$TMPDIR_NC/setfwd.xml"; then
 fi
 log_event "namecheap_fwd_ok" 0 ""
 
-echo "==> [4/5] Recording in database..."
+echo "==> [6/8] Recording in database..."
 log_event "db_upsert_start" 0 ""
 if psql "$AIB_DSN" -v ON_ERROR_STOP=1 -c \
   "INSERT INTO customer_sites(customer_email,domain,contabo_path)
@@ -223,7 +270,32 @@ else
   rc=$?; log_event "db_upsert_failed" "$rc" ""; exit $rc
 fi
 
-echo "==> [5/5] Brief pass..."
+echo "==> [7/8] Seeding Paperclip customer + domain..."
+log_event "paperclip_seed_start" 0 ""
+if psql "$PAPERCLIP_DSN" -v ON_ERROR_STOP=1 -c \
+  "WITH upserted_customer AS (
+     INSERT INTO customers (email, status, lifecycle_stage)
+     VALUES ('$CUSTOMER_EMAIL', 'active', 'onboarding')
+     ON CONFLICT (email) DO UPDATE SET
+       status        = CASE WHEN customers.status IN ('lead','lapsed') THEN 'active' ELSE customers.status END,
+       lifecycle_stage = CASE WHEN customers.lifecycle_stage = 'lead' THEN 'onboarding' ELSE customers.lifecycle_stage END,
+       updated_at    = now()
+     RETURNING id
+   )
+   INSERT INTO domains (customer_id, fqdn, contabo_path, dns_provider, status)
+   SELECT id, '$DOMAIN', '/var/www/$DOMAIN', 'namecheap', 'active'
+   FROM upserted_customer
+   ON CONFLICT (fqdn) DO UPDATE SET
+     customer_id  = EXCLUDED.customer_id,
+     contabo_path = EXCLUDED.contabo_path,
+     status       = 'active',
+     updated_at   = now()"; then
+  log_event "paperclip_seed_ok" 0 ""
+else
+  rc=$?; log_event "paperclip_seed_failed" "$rc" ""; exit $rc
+fi
+
+echo "==> [8/8] Brief pass..."
 if [[ -n "$BRIEF_PATH" ]]; then
   log_event "brief_pass_start" 0 "$BRIEF_PATH"
   REMOTE_BRIEF="/var/www/$DOMAIN/.aib-brief.txt"

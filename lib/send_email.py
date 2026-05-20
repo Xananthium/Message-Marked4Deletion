@@ -109,11 +109,12 @@ def send(
     with psycopg2.connect(_DSN) as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO issue_comments (issue_id, body, created_at)
-            VALUES (%s, %s, now())
+            INSERT INTO issue_comments (issue_id, company_id, body, created_at)
+            VALUES (%s, %s, %s, now())
             """,
             (
                 issue_id,
+                '3f6ac8c4-e9ec-4fd3-b644-b7cb5d15bfa6',
                 f"[send_email] Sent to {recipient} | gmail_id={gmail_msg_id}",
             ),
         )

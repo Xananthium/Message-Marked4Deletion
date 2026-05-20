@@ -59,6 +59,44 @@ log = logging.getLogger("aib")
 MERCER_AGENT_ID = "cfaac33f-c89a-43d6-95dd-2a9587d1d69d"
 
 # ---------------------------------------------------------------------------
+# Keyword-based routing: after alias matching fails, scan subject + body for
+# keywords before falling to Mercer. Each entry is (keyword_set, agent_id,
+# category_label). First match wins. The category_label and matched keyword
+# are stored in issue metadata as suggested_route so Mercer (or anyone) can
+# see what the poller thought.
+# ---------------------------------------------------------------------------
+KEYWORD_ROUTES: list[tuple[set[str], str, str]] = [
+    # Billing / money → Paulina (CEO handles business ops)
+    (
+        {"invoice", "bill", "payment", "billing", "charge", "refund",
+         "receipt", "pricing", "subscription", "cancel"},
+        "38d8400a-3d0a-44ff-b430-a228180bc1e5",
+        "billing",
+    ),
+    # Engineering / site problems → Reed (Coder)
+    (
+        {"bug", "broken", "404", "error", "crash", "down", "not working",
+         "fix", "offline", "slow", "500", "503", "timeout"},
+        "d9431040-6d05-4bb2-be63-3a87e79abf32",
+        "engineering",
+    ),
+    # Visual / design / image requests → Hollis (image-gen craftsperson)
+    (
+        {"logo", "image", "graphic", "design", "brand", "banner", "hero",
+         "photo", "picture", "icon"},
+        "66133a39-6dde-4a11-86c1-3e1846d447d1",
+        "design",
+    ),
+    # Marketing / SEO / content → Sage (Marketing Manager)
+    (
+        {"marketing", "seo", "search", "traffic", "ads", "campaign",
+         "rank", "google", "content", "blog", "newsletter", "outreach"},
+        "49b01a5f-3df2-4f34-a5f1-d06e0a292851",
+        "marketing",
+    ),
+]
+
+# ---------------------------------------------------------------------------
 # Routing: To: / Delivered-To: header -> agents.email_alias
 # No alias match -> defaults to Mercer at the call site.
 # ---------------------------------------------------------------------------
@@ -79,6 +117,22 @@ def match_agent_by_to_header(conn, message) -> Optional[str]:
         cur.execute("SELECT id FROM agents WHERE LOWER(email_alias) = ANY(%s) LIMIT 1", (addrs,))
         row = cur.fetchone()
         return str(row[0]) if row else None
+
+
+def match_agent_by_keywords(subject: str, body: str) -> tuple[str | None, str | None, str | None]:
+    """Scan subject + body for routing keywords after alias matching fails.
+
+    Returns (agent_id, matched_keyword, category_label) for the first match,
+    or (None, None, None) if no keyword hits.
+    """
+    text = f"{subject} {body}".lower()
+    for keyword_set, agent_id, category in KEYWORD_ROUTES:
+        for kw in keyword_set:
+            # Use word-boundary match to avoid false positives
+            # (e.g. "designer" should not match "design" alone)
+            if re.search(rf'\b{re.escape(kw)}\b', text):
+                return agent_id, kw, category
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -191,12 +245,14 @@ def create_issue_for_email(
     customer: Customer,
     msg: dict,
     assignee_agent_id: str | None = None,
+    suggested_route: dict | None = None,
 ) -> tuple[str, str]:
     """Create a new `todo` issue for an inbound customer email.
 
     - Bumps companies.issue_counter atomically.
     - Sets identifier = '<issue_prefix>-' || new_counter.
     - Seeds the issue with a first comment carrying the gmail thread metadata.
+    - If suggested_route is provided, includes keyword routing info in metadata.
 
     Returns (issue_id, identifier).
     """
@@ -256,6 +312,8 @@ def create_issue_for_email(
         "inbound_subject": subject,
         "inbound_from": msg.get("from"),
     }
+    if suggested_route:
+        metadata["suggested_route"] = suggested_route
     append_comment(
         pc_conn,
         company_id=company_id,
@@ -383,13 +441,45 @@ def process_message(
         }
 
     # No existing thread -> new issue.
-    # Route by To: header against agents.email_alias; no alias match
-    # defaults to Mercer for triage (operator-locked 2026-05-19).
-    # email_assignee_agent_id is intentionally ignored.
-    assignee = match_agent_by_to_header(pc_conn, msg) or email_assignee or MERCER_AGENT_ID
+    # Routing priority:
+    #   1. To-header alias match (direct)
+    #   2. Keyword match on subject + body (direct with suggested_route trail)
+    #   3. email_assignee_agent_id env var
+    #   4. Mercer (triager fallback)
+    subject = (msg.get("subject") or "").strip()
+    body = (msg.get("body") or "").strip()
+    suggested_route = None
+
+    assignee = match_agent_by_to_header(pc_conn, msg)
+    if assignee is None:
+        # Alias match failed — try keyword routing.
+        kw_agent, kw_keyword, kw_category = match_agent_by_keywords(subject, body)
+        if kw_agent:
+            assignee = kw_agent
+            suggested_route = {
+                "method": "keyword",
+                "category": kw_category,
+                "matched_keyword": kw_keyword,
+                "agent_id": kw_agent,
+            }
+            log.info(
+                "keyword route: category=%s keyword=%r -> agent=%s",
+                kw_category, kw_keyword, kw_agent,
+            )
+    if assignee is None:
+        assignee = email_assignee or MERCER_AGENT_ID
+        if suggested_route is None:
+            suggested_route = {
+                "method": "fallback",
+                "category": None,
+                "matched_keyword": None,
+                "agent_id": assignee,
+            }
+
     issue_id, identifier = create_issue_for_email(
         pc_conn, company_id, customer, msg,
         assignee_agent_id=assignee,
+        suggested_route=suggested_route,
     )
     pc_conn.commit()
     log.info("created issue %s for sender=%s subject=%r", identifier, sender, msg.get("subject"))
@@ -408,6 +498,7 @@ def process_message(
         "action": "new_issue",
         "issue_id": issue_id,
         "identifier": identifier,
+        "suggested_route": suggested_route,
     }
 
 

@@ -9,6 +9,7 @@ import base64
 import email.utils
 import email.message
 import logging
+from datetime import datetime, timezone, timedelta
 import psycopg
 
 def maybe_decrypt(path: str) -> str:
@@ -146,11 +147,13 @@ def fetch_message(svc, mailbox: str, msg_id: str) -> dict:
         data = (payload.get("body") or {}).get("data", "")
         body = _decode_part(data) if data else ""
 
+    to_header = headers.get("Delivered-To", headers.get("To", ""))
     return {
         "id": msg_id,
         "thread_id": raw.get("threadId", ""),
         "from": headers.get("From", ""),
-        "to": headers.get("Delivered-To", headers.get("To", "")),
+        "to": to_header,
+        "to_header_raw": headers.get("To", ""),
         "subject": headers.get("Subject", ""),
         "body": body,
         "message_id_hdr": headers.get("Message-ID", ""),
@@ -164,6 +167,80 @@ def parse_sender(raw_from: str) -> str:
     if not addr:
         raise ValueError(f"cannot parse sender from: {raw_from!r}")
     return addr
+
+
+# ---------------------------------------------------------------------------
+# Unsubscribe / opt-out detection
+# ---------------------------------------------------------------------------
+
+_UNSUBSCRIBE_KEYWORDS = [
+    "unsubscribe", "stop", "opt out", "opt-out",
+    "remove", "no further", "do not contact",
+]
+
+
+def is_unsubscribe_request(msg: dict) -> bool:
+    """Return True if *msg* appears to be an unsubscribe/opt-out request.
+
+    Checks: (1) recipient contains unsubscribe@, (2) subject or body
+    contains any known opt-out keyword.
+    """
+    # Check recipient addresses — both the delivery target and original To
+    for hdr in (msg.get("to", ""), msg.get("to_header_raw", "")):
+        addr = email.utils.parseaddr(hdr)[1].lower()
+        if "unsubscribe" in addr:
+            return True
+
+    # Check message content for opt-out keywords
+    text = f"{msg.get('subject', '')} {msg.get('body', '')}".lower()
+    return any(kw in text for kw in _UNSUBSCRIBE_KEYWORDS)
+
+
+def process_unsubscribe(conn: psycopg.Connection, sender_email: str) -> None:
+    """Find the lead matching *sender_email* and mark as do-not-contact.
+
+    Sets do_not_contact_until to 5 years from now, appends the
+    do_not_contact marketing tag, sets stage, and logs a timestamped
+    note.  Commits the transaction on success.
+
+    If no lead is found the call is a no-op (log only).
+    """
+    cutoff = datetime.now(timezone.utc) + timedelta(days=365 * 5)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    note_entry = f"[{timestamp}] Opt-out request honored (unsubscribe/stop)"
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, notes FROM leads WHERE LOWER(contact_email) = %s",
+            (sender_email.lower(),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            log.info("unsubscribe: no lead found for %s", sender_email)
+            return
+
+        lead_id, existing_notes = row
+        new_notes = (
+            f"{existing_notes}\n{note_entry}".strip()
+            if existing_notes
+            else note_entry
+        )
+
+        cur.execute(
+            "UPDATE leads SET"
+            "  do_not_contact_until = %s,"
+            "  stage = 'do_not_contact',"
+            "  marketing_tags = array_append(marketing_tags, %s),"
+            "  notes = %s,"
+            "  updated_at = now()"
+            " WHERE id = %s",
+            (cutoff, "do_not_contact", new_notes, lead_id),
+        )
+    conn.commit()
+    log.info(
+        "unsubscribe: lead %s (%s) marked do_not_contact until %s",
+        lead_id, sender_email, cutoff.isoformat(),
+    )
 
 
 def mark_read(svc, mailbox: str, msg_id: str) -> None:
@@ -472,6 +549,28 @@ def process_message(svc, conn: psycopg.Connection, cfg: Config, msg_id: str) -> 
     # Step 1-2: fetch and identify sender
     msg = fetch_message(svc, cfg.mailbox, msg_id)
     sender = parse_sender(msg["from"])
+
+    # Step 1b: skip operator-originated messages to prevent forwarding loops.
+    # The operator replying to an [AIB forward] would otherwise be picked up,
+    # re-processed, and re-forwarded — creating an infinite loop.
+    if sender.lower() == cfg.operator_email.lower():
+        log.info("skipping operator-originated message from %s", sender)
+        mark_read(svc, cfg.mailbox, msg_id)
+        return
+
+    # Step 1c: skip already-forwarded messages as a secondary loop guard.
+    if msg["subject"].strip().startswith("[AIB forward]"):
+        log.info("skipping already-forwarded message (subject=%s)", msg["subject"][:80])
+        mark_read(svc, cfg.mailbox, msg_id)
+        return
+
+    # Step 2a: unsubscribe/opt-out detection — handle silently, no Paperclip issue
+    if is_unsubscribe_request(msg):
+        log.info("unsubscribe detected from %s (thread=%s)", sender, msg["thread_id"])
+        process_unsubscribe(conn, sender)
+        mark_read(svc, cfg.mailbox, msg_id)
+        clear_pending(conn, msg["id"])
+        return
 
     # Step 3: site lookup — unknown sender path
     # Forward once, mark READ so we never re-forward the same message.

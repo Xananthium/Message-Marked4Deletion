@@ -143,9 +143,24 @@ def lookup_customer(pc_conn: psycopg.Connection, sender_email: str, mailbox: str
 
 
 def find_issue_by_thread(pc_conn: psycopg.Connection, company_id: str, thread_id: str) -> str | None:
-    """OPERATOR-LOCKED 2026-05-19: new email = new issue. thread_id kept on issue metadata
-    for UI grouping only. This function returns None to disable reattach."""
-    return None
+    """Find an open (non-terminal) issue whose comments carry the given gmail_thread_id.
+    Returns the issue id string if found, else None."""
+    with pc_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT i.id::text
+            FROM issues i
+            JOIN issue_comments ic ON ic.issue_id = i.id
+            WHERE ic.company_id = %s
+              AND ic.metadata->>'gmail_thread_id' = %s
+              AND i.status NOT IN ('done', 'cancelled')
+            ORDER BY i.created_at DESC
+            LIMIT 1
+            """,
+            (company_id, thread_id),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
 
 
 def append_comment(
@@ -298,11 +313,24 @@ def process_message(
     """Process a single inbound Gmail message under the v2 flow.
 
     Returns a dict describing what happened (useful for dry-run tests):
-      {'action': 'unknown_sender' | 'new_issue' | 'comment_appended',
+      {'action': 'skipped_operator' | 'skipped_forward' | 'unknown_sender'
+                | 'new_issue' | 'comment_appended',
        'issue_id': ..., 'identifier': ..., 'comment_id': ...}
     """
     msg = fake_msg if fake_msg is not None else fetch_message(svc, cfg.mailbox, msg_id)
     sender = parse_sender(msg["from"])
+
+    # Skip operator-originated messages to prevent forwarding loops.
+    if sender.lower() == cfg.operator_email.lower():
+        log.info("skipping operator-originated message from %s", sender)
+        mark_read(svc, cfg.mailbox, msg_id)
+        return {"action": "skipped_operator", "sender": sender}
+
+    # Skip already-forwarded messages as a secondary loop guard.
+    if msg["subject"].strip().startswith("[AIB forward]"):
+        log.info("skipping already-forwarded message (subject=%s)", msg["subject"][:80])
+        mark_read(svc, cfg.mailbox, msg_id)
+        return {"action": "skipped_forward", "subject": msg["subject"][:80]}
 
     # Unknown sender path.
     customer = lookup_customer(pc_conn, sender, cfg.mailbox)
@@ -358,7 +386,7 @@ def process_message(
     # Route by To: header against agents.email_alias; no alias match
     # defaults to Mercer for triage (operator-locked 2026-05-19).
     # email_assignee_agent_id is intentionally ignored.
-    assignee = match_agent_by_to_header(pc_conn, msg) or MERCER_AGENT_ID
+    assignee = match_agent_by_to_header(pc_conn, msg) or email_assignee or MERCER_AGENT_ID
     issue_id, identifier = create_issue_for_email(
         pc_conn, company_id, customer, msg,
         assignee_agent_id=assignee,
@@ -393,9 +421,9 @@ def main() -> int:
     cfg = load_config()
     pc_dsn, company_id, email_assignee = load_paperclip_env()
     if email_assignee:
-        log.warning(
-            "PAPERCLIP_EMAIL_ASSIGNEE_AGENT_ID=%s is set but IGNORED — "
-            "alias routing replaced default assignment 2026-05-19",
+        log.info(
+            "PAPERCLIP_EMAIL_ASSIGNEE_AGENT_ID=%s set — will be used as fallback "
+            "when no To-header alias match",
             email_assignee,
         )
 

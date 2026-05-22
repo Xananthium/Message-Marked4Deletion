@@ -140,10 +140,9 @@ a closed ticket is a new request.
 
 ## Files & service
 
-- `/home/discnxt/aib/poller_v2.py` -- the active poller.
-- `/home/discnxt/aib/poller.py` -- v1, kept untouched as fallback.
+- `/home/discnxt/aib/poller.py` -- the canonical poller (single file, no v1/v2 split).
 - `/etc/systemd/system/aib-poller.service` -- ExecStart points at
-  `poller_v2.py`. Two `EnvironmentFile=` lines: `.env` (gmail + DSN for
+  `poller.py`. Two `EnvironmentFile=` lines: `.env` (gmail + DSN for
   pending_emails) and `paperclip-poller-api.env` (paperclip DSN + API
   key + company id).
 - `/etc/systemd/system/aib-poller.timer` -- unchanged, every 5 min.

@@ -9,6 +9,7 @@ User=discnxt
 Group=discnxt
 WorkingDirectory=/home/discnxt/aib
 EnvironmentFile=/home/discnxt/aib/.env
+EnvironmentFile=/home/discnxt/.secrets/paperclip-poller-api.env
 Environment=PATH=/home/discnxt/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 /home/discnxt/aib/poller.py
 StandardOutput=journal

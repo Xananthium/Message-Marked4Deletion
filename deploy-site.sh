@@ -83,6 +83,18 @@ fi
 
 _init_audit_log
 
+# --- DB pre-flight: refuse to deploy an unprovisioned domain ---
+source /home/discnxt/.secrets/paperclip-poller-api.env
+if ! psql "$PAPERCLIP_DSN" -t -A -c \
+  "SELECT 1 FROM sites WHERE fqdn = lower('${DOMAIN}') AND status = 'active'" \
+  2>/dev/null | grep -q 1; then
+  audit "preflight_db_miss" 1 "fqdn=$DOMAIN not in sites table"
+  echo "ERROR: $DOMAIN is not in the Paperclip sites table (status=active)." >&2
+  echo "Run provision-site.sh $DOMAIN <customer-email> first." >&2
+  exit 1
+fi
+audit "preflight_db_ok" 0 "fqdn=$DOMAIN"
+
 SRC="$SITES_ROOT/$DOMAIN/public/"
 DEST="$CONTABO_HOST:$REMOTE_WWW_ROOT/$DOMAIN/"
 

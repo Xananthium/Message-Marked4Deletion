@@ -29,7 +29,7 @@ YELLOW — core pipeline proven end-to-end; one blocking defect (aider PATH in s
 ## Operator TODO
 1. Fix aider PATH before enabling timer: either add `Environment=PATH=/home/discnxt/.local/bin:/usr/local/bin:/usr/bin:/bin` to aib-poller.service, or symlink `sudo ln -s ~/.local/bin/aider /usr/local/bin/aider`. This is blocking.
 2. Create `/home/discnxt/aib/.env` from `.env.example` — fill in: AIB_DSN (full DSN with host/user if not peer-auth), AIB_SA_PATH, AIB_MAILBOX, AIB_OPERATOR_EMAIL, AIB_SSH_ALIAS, AIB_MODEL, NAMECHEAP_* values, CONTABO_IP, CONTABO_SSH (currently missing from .env.example — add it).
-3. Confirm Workspace service account at AIB_SA_PATH has domain-wide delegation for `gmail.modify` and `gmail.send` scopes impersonating `team@digitaldisconnections.com`.
+3. Confirm Workspace service account at AIB_SA_PATH has domain-wide delegation for `https://mail.google.com/` scope impersonating `team@digitaldisconnections.com`.
 4. Test Contabo SSH alias: `ssh contabo echo ok` must succeed without a passphrase from the discnxt user account (the systemd service has no TTY).
 5. Provision the first real customer site: `bash /home/discnxt/aib/provision-site.sh <domain> <customer_email>` — verify the DB row, Caddy block, and DNS all land cleanly.
 6. Run `sudo bash /home/discnxt/aib/install-systemd.sh` to install + enable the timer. Confirm `systemctl list-timers | grep aib` shows a next trigger time.

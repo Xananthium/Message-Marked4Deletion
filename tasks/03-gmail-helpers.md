@@ -13,7 +13,7 @@ Add all Gmail-side functions to `poller.py`: build the authenticated client with
 
 ## Implementation notes
 - Imports to add: `from google.oauth2 import service_account`, `from googleapiclient.discovery import build`, `from googleapiclient.errors import HttpError`.
-- `def gmail_client(sa_path: str, subject: str)`: build SA credentials with scopes `["https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/gmail.send"]`, call `.with_subject(subject)` for DWD, return `build("gmail", "v1", credentials=creds, cache_discovery=False)`.
+- `def gmail_client(sa_path: str, subject: str)`: build SA credentials with scopes `["https://mail.google.com/"]`, call `.with_subject(subject)` for DWD, return `build("gmail", "v1", credentials=creds, cache_discovery=False)`.
 - `def list_unread(svc, mailbox: str) -> list[dict]`: `svc.users().messages().list(userId=mailbox, q="is:unread", maxResults=25).execute().get("messages", [])`.
 - `def fetch_message(svc, mailbox: str, msg_id: str) -> dict`: `format="full"`. Extract headers `From`, `Subject`, `Message-ID`, `References`, `In-Reply-To`, `threadId`. Body: walk `payload.parts` recursively for the first `text/plain` part; base64url-decode (`base64.urlsafe_b64decode`); fall back to `payload.body.data` for non-multipart. Return `{"id": msg_id, "thread_id": ..., "from": ..., "subject": ..., "body": ..., "message_id_hdr": ..., "references": ...}`.
 - `def parse_sender(raw_from: str) -> str`: `email.utils.parseaddr(raw_from)[1].lower().strip()`; raise `ValueError` if empty.

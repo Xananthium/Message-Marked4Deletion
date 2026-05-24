@@ -20,6 +20,7 @@ For each inbound email to AIB_MAILBOX:
 
 import base64
 import dataclasses
+import datetime
 import email.message
 import email.utils
 import json
@@ -32,6 +33,8 @@ import subprocess
 import sys
 import tempfile
 from typing import Optional
+
+import urllib.request
 
 import psycopg
 from google.oauth2 import service_account
@@ -84,7 +87,7 @@ def load_config() -> Config:
 # Gmail helpers
 # ---------------------------------------------------------------------------
 
-_GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+_GMAIL_SCOPES = ["https://mail.google.com/"]
 
 
 def maybe_decrypt(path: str) -> str:
@@ -141,6 +144,45 @@ def _decode_part(data: str) -> str:
     return base64.urlsafe_b64decode(data + "=" * (padding % 4)).decode("utf-8", errors="replace")
 
 
+def _collect_attachments(payload: dict) -> list[dict]:
+    """Walk the MIME tree and collect attachment descriptors.
+
+    Returns list of dicts: filename, mimeType, attachmentId, size, data (inline b64url).
+    Skips text/plain, text/html, and container multipart/* parts with no filename.
+
+    Inline images in multipart/related may arrive with no filename and no
+    attachmentId when Gmail API only populates body.size.  We collect any
+    leaf non-text part that carries content so inline images are not lost.
+    """
+    results: list[dict] = []
+    mime = payload.get("mimeType", "")
+    body = payload.get("body") or {}
+    filename = (payload.get("filename") or "").strip()
+    attachment_id = body.get("attachmentId", "")
+    data = body.get("data", "")
+    size = body.get("size", 0)
+
+    # Collect any non-text leaf part that carries content (filename, attachmentId,
+    # inline data, or non-zero size).  This catches inline images in
+    # multipart/related that may lack both filename and attachmentId.
+    is_leaf = not payload.get("parts")
+    has_content = filename or attachment_id or data or (is_leaf and size > 0)
+
+    if has_content and mime not in ("text/plain", "text/html"):
+        results.append({
+            "filename": filename or "attachment",
+            "mimeType": mime,
+            "attachmentId": attachment_id,
+            "size": size,
+            "data": data,
+        })
+
+    for part in payload.get("parts", []):
+        results.extend(_collect_attachments(part))
+
+    return results
+
+
 def _walk_parts(payload: dict) -> str:
     mime = payload.get("mimeType", "")
     if mime == "text/plain":
@@ -150,6 +192,19 @@ def _walk_parts(payload: dict) -> str:
         return ""
     for part in payload.get("parts", []):
         result = _walk_parts(part)
+        if result:
+            return result
+    return ""
+
+
+def _walk_delivery_status(payload: dict) -> str:
+    """Walk the MIME tree and return the message/delivery-status body (RFC 3464)."""
+    mime = payload.get("mimeType", "")
+    if mime == "message/delivery-status":
+        data = (payload.get("body") or {}).get("data", "")
+        return _decode_part(data) if data else ""
+    for part in payload.get("parts", []):
+        result = _walk_delivery_status(part)
         if result:
             return result
     return ""
@@ -180,9 +235,11 @@ def fetch_message(svc, mailbox: str, msg_id: str) -> dict:
         "to_header_raw": headers.get("To", ""),
         "subject": headers.get("Subject", ""),
         "body": body,
+        "delivery_status": _walk_delivery_status(payload),
         "message_id_hdr": headers.get("Message-ID", ""),
         "references": headers.get("References", ""),
         "in_reply_to": headers.get("In-Reply-To", ""),
+        "attachments": _collect_attachments(payload),
     }
 
 
@@ -209,6 +266,86 @@ def mark_unread(svc, mailbox: str, msg_id: str) -> None:
         ).execute()
     except HttpError as e:
         raise RuntimeError(f"gmail mark_unread: {e}") from e
+
+
+_ATTACHMENT_BASE = pathlib.Path("/home/discnxt/aib/attachments")
+
+
+def save_attachments(
+    svc,
+    mailbox: str,
+    gmail_msg_id: str,
+    issue_id: str,
+    attachments: list[dict],
+    dry_run: bool = False,
+) -> list[dict]:
+    """Fetch and save Gmail attachments to /home/discnxt/aib/attachments/{issue_id}/.
+
+    Returns list of {path, filename, mimeType, size} for each saved file.
+    In dry_run mode the Gmail API is not called and no files are written;
+    descriptors are returned with projected paths so callers can still log them.
+    """
+    if not attachments:
+        return []
+
+    save_dir = _ATTACHMENT_BASE / issue_id
+    if not dry_run:
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved: list[dict] = []
+    for att in attachments:
+        filename = att.get("filename") or "attachment"
+        safe_name = re.sub(r"[^\w.\-]", "_", filename) or "attachment"
+        mime = att.get("mimeType", "")
+
+        raw_data = att.get("data", "")
+        if not raw_data and att.get("attachmentId"):
+            if dry_run:
+                saved.append({"path": str(save_dir / safe_name), "filename": filename, "mimeType": mime, "size": att.get("size", 0)})
+                continue
+            try:
+                resp = svc.users().messages().attachments().get(
+                    userId=mailbox,
+                    messageId=gmail_msg_id,
+                    id=att["attachmentId"],
+                ).execute()
+                raw_data = resp.get("data", "")
+            except HttpError as exc:
+                log.warning("failed to fetch attachment %s from msg %s: %s", filename, gmail_msg_id, exc)
+                continue
+
+        if not raw_data:
+            if att.get("size", 0) > 0:
+                log.warning(
+                    "attachment %s (%s, %d bytes) has no inline data and no attachmentId; "
+                    "possible inline image with missing Gmail API fields",
+                    filename, mime, att.get("size", 0),
+                )
+            continue
+
+        padding = 4 - len(raw_data) % 4
+        try:
+            file_bytes = base64.urlsafe_b64decode(raw_data + "=" * (padding % 4))
+        except Exception as exc:
+            log.warning("failed to decode attachment %s: %s", filename, exc)
+            continue
+
+        if dry_run:
+            saved.append({"path": str(save_dir / safe_name), "filename": filename, "mimeType": mime, "size": len(file_bytes)})
+            continue
+
+        out_path = save_dir / safe_name
+        if out_path.exists():
+            stem, suffix = out_path.stem, out_path.suffix
+            i = 1
+            while out_path.exists():
+                out_path = save_dir / f"{stem}_{i}{suffix}"
+                i += 1
+        out_path.write_bytes(file_bytes)
+        log.info("saved attachment %s -> %s (%d bytes)", filename, out_path, len(file_bytes))
+        saved.append({"path": str(out_path), "filename": filename, "mimeType": mime, "size": len(file_bytes)})
+
+    return saved
 
 
 def forward_to_operator(svc, mailbox: str, operator_email: str, original: dict) -> None:
@@ -267,17 +404,22 @@ def record_pending(conn: psycopg.Connection, msg: dict, reason: str) -> None:
     conn.commit()
 
 
-def fetch_pending_due(conn: psycopg.Connection) -> list[tuple[str, dict]]:
+def fetch_pending_due(
+    conn: psycopg.Connection,
+    known_customer_emails: set[str] | None = None,
+) -> list[tuple[str, dict]]:
     """Return list of (gmail_msg_id, message_dict) for pending emails due for retry.
 
-    Only returns rows where retry_count < MAX_RETRIES and next_retry <= now()
-    AND reason != 'unknown_sender' (these should not be retried).
-    Each dict contains sender, subject, and reason from pending_emails.
+    Returns rows where retry_count < MAX_RETRIES and next_retry <= now().
+    For unknown_sender rows, only includes them when the sender's parsed address
+    appears in known_customer_emails (lowercase set from the customers table).
+    Pass None to skip all unknown_sender retries (old safe behavior).
+    Other rows are included unconditionally.
     """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT gmail_msg_id, sender, subject, reason FROM pending_emails "
-            "WHERE retry_count < %s AND next_retry <= now() AND reason != 'unknown_sender' "
+            "WHERE retry_count < %s AND next_retry <= now() "
             "ORDER BY next_retry",
             (MAX_RETRIES,)
         )
@@ -285,6 +427,12 @@ def fetch_pending_due(conn: psycopg.Connection) -> list[tuple[str, dict]]:
 
     result = []
     for gmail_msg_id, sender, subject, reason in rows:
+        if reason == "unknown_sender":
+            if not known_customer_emails:
+                continue
+            sender_addr = email.utils.parseaddr(sender or "")[1].lower().strip()
+            if sender_addr not in known_customer_emails:
+                continue
         msg = {
             "id": gmail_msg_id,
             "from": sender or "",
@@ -315,6 +463,247 @@ def clear_pending(conn: psycopg.Connection, gmail_msg_id: str) -> None:
 # assigned to her and she routes or owns it. If she can't decide, she
 # escalates to Paulina. No more unassigned team@ queue.
 MERCER_AGENT_ID = "cfaac33f-c89a-43d6-95dd-2a9587d1d69d"
+_OPEN_STATUSES = ['todo', 'in_progress', 'in_review', 'blocked']
+
+# ---------------------------------------------------------------------------
+# Auto-close filter: machine-generated email patterns
+# ---------------------------------------------------------------------------
+
+MACHINE_SENDER_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'no-reply@dmarc\.google\.com', re.I), 'dmarc_report'),
+    (re.compile(r'mailer-daemon@', re.I), 'bounce'),
+    (re.compile(r'^postmaster@', re.I), 'postmaster'),
+    (re.compile(r'noreply@.*\.bounces\.google\.com', re.I), 'bounce'),
+]
+
+MACHINE_SUBJECT_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'^Report domain:', re.I), 'dmarc_report'),
+    (re.compile(r'delivery status notification', re.I), 'bounce'),
+    (re.compile(r'undeliverable', re.I), 'bounce'),
+    (re.compile(r'failure notice', re.I), 'bounce'),
+    (re.compile(r'mail delivery failed', re.I), 'bounce'),
+    (re.compile(r'returned mail', re.I), 'bounce'),
+    (re.compile(r'^auto-reply:', re.I), 'machine_report'),
+    (re.compile(r'^out of office', re.I), 'machine_report'),
+    (re.compile(r'\[spam\]', re.I), 'spam'),
+]
+
+_KNOWN_MACHINE_CATEGORIES = frozenset(
+    ['dmarc_report', 'bounce', 'postmaster', 'machine_report', 'spam']
+)
+
+LLM_AUTO_CLOSE_PROMPT_TEMPLATE = (
+    "You are an email classifier. Classify the following email as one of:\n"
+    "dmarc_report, bounce, postmaster, machine_report, spam, human\n\n"
+    "Respond with ONLY the category label — nothing else.\n\n"
+    "From: {sender}\n"
+    "Subject: {subject}\n"
+    "Body (first 200 chars): {body_excerpt}\n\n"
+    "Category:"
+)
+
+
+def classify_inbound(sender: str, subject: str, body: str) -> tuple[str, str] | None:
+    """Classify an inbound email as machine-generated or return None for human mail.
+
+    Returns (category, rule_matched) if machine-generated, None otherwise.
+    Fail-open: LLM errors return None so normal triage continues.
+    """
+    for pattern, category in MACHINE_SENDER_PATTERNS:
+        if pattern.search(sender):
+            return (category, f'sender:{pattern.pattern}')
+
+    for pattern, category in MACHINE_SUBJECT_PATTERNS:
+        if pattern.search(subject):
+            return (category, f'subject:{pattern.pattern}')
+
+    # LLM fallback — local Ollama only
+    try:
+        model = os.environ.get('AIB_MODEL', 'llama3')
+        prompt = LLM_AUTO_CLOSE_PROMPT_TEMPLATE.format(
+            sender=sender,
+            subject=subject,
+            body_excerpt=body[:200],
+        )
+        payload = json.dumps({'model': model, 'prompt': prompt, 'stream': False}).encode()
+        req = urllib.request.Request(
+            'http://localhost:11434/api/generate',
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        category = data.get('response', '').strip().lower()
+        if category in _KNOWN_MACHINE_CATEGORIES:
+            return (category, f'llm:{model}')
+    except Exception:
+        pass  # fail-open: LLM unreachable → normal triage
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bounce recipient extraction and outreach flagging
+# ---------------------------------------------------------------------------
+
+# Ordered from most-specific (RFC 3464 machine-readable) to broadest fallback.
+_BOUNCE_RECIPIENT_PATTERNS: list[re.Pattern] = [
+    re.compile(r'Final-Recipient:\s*(?:rfc822;\s*)?([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+    re.compile(r'Original-Recipient:\s*(?:rfc822;\s*)?([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+    re.compile(r'X-Failed-Recipients:\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+    # Google Workspace style
+    re.compile(r'The following address(?:es)? had.*?(?:errors?|failures?)[\s\S]{0,200}?([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+    # Outlook/MS Exchange
+    re.compile(r'Delivery has failed to (?:these|this) recipient[s\s]*(?:or groups?)?[\s:]*\n+\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+    # Generic "failed permanently" or "delivery failed" with address on next line
+    re.compile(r'(?:failed permanently|delivery failed|undeliverable)[^\n]{0,100}\n+\s*([\w.+%-]+@[\w.-]+\.[a-zA-Z]{2,})', re.I),
+]
+
+
+def extract_bounce_recipient(subject: str, body: str, delivery_status: str = "") -> str | None:
+    """Extract the failed recipient address from a DSN.
+
+    Searches the RFC 3464 delivery-status payload first, then the human-readable
+    body, then the subject.  Returns a lowercase email string or None.
+    """
+    # delivery_status is highest fidelity (machine-readable per RFC 3464)
+    search_text = f"{delivery_status}\n{subject}\n{body}"
+    for pattern in _BOUNCE_RECIPIENT_PATTERNS:
+        m = pattern.search(search_text)
+        if m:
+            candidate = m.group(1).strip().lower().rstrip('.')
+            if '@' in candidate and '.' in candidate.split('@')[-1]:
+                return candidate
+    return None
+
+
+def flag_outreach_bounce(pc_conn: psycopg.Connection, bounced_email: str) -> bool:
+    """Mark a lead and its most-recent sent contact_attempt as bounced.
+
+    Sets leads.stage = 'do_not_contact' and contact_attempts.outcome = 'bounced'
+    for the most-recent email attempt that was still 'sent'.
+    Does NOT commit — caller is responsible.
+    Returns True if a lead was found and updated.
+    """
+    with pc_conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM leads WHERE LOWER(contact_email) = LOWER(%s)"
+            " AND stage != 'do_not_contact' LIMIT 1",
+            (bounced_email,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return False
+        lead_id = row[0]
+
+        cur.execute(
+            """
+            UPDATE contact_attempts
+               SET outcome = 'bounced', outcome_at = now()
+             WHERE id = (
+               SELECT id FROM contact_attempts
+                WHERE lead_id = %s AND channel = 'email' AND outcome = 'sent'
+                ORDER BY attempted_at DESC
+                LIMIT 1
+             )
+            """,
+            (lead_id,),
+        )
+        cur.execute(
+            "UPDATE leads SET stage = 'do_not_contact', updated_at = now() WHERE id = %s",
+            (lead_id,),
+        )
+
+    log.info("bounce: flagged lead %s (%s) as do_not_contact", lead_id, bounced_email)
+    return True
+
+
+def auto_close_message(
+    svc,
+    pc_conn: psycopg.Connection,
+    pending_conn: psycopg.Connection,
+    cfg,
+    company_id: str,
+    msg: dict,
+    sender: str,
+    category: str,
+    rule_matched: str,
+    llm_used: bool,
+) -> None:
+    """Create a done issue for a machine-generated email and audit-log it."""
+    machine_customer = Customer(
+        customer_id='(machine)',
+        email=sender,
+        name=None,
+        business_name=None,
+        fqdn=None,
+        contabo_path=None,
+    )
+    issue_id, identifier = create_issue_for_email(
+        pc_conn,
+        company_id,
+        machine_customer,
+        msg,
+        assignee_agent_id=None,
+        status='done',
+        origin_kind='machine_report',
+    )
+    seed_body = (
+        f'Auto-closed: {category} (rule: {rule_matched})\n\n'
+        f'From: {msg["from"]}\n'
+        f'Subject: {msg.get("subject", "")}'
+    )
+    append_comment(
+        pc_conn,
+        company_id=company_id,
+        issue_id=issue_id,
+        body=seed_body,
+        metadata={
+            'auto_close': True,
+            'category': category,
+            'rule_matched': rule_matched,
+            'llm_used': llm_used,
+        },
+        author_user_id='system',
+    )
+    mark_read(svc, cfg.mailbox, msg['id'])
+
+    # For bounces: extract the failed recipient and flag the outreach DB.
+    if category == 'bounce':
+        bounced = extract_bounce_recipient(
+            msg.get('subject', ''),
+            msg.get('body', ''),
+            msg.get('delivery_status', ''),
+        )
+        if bounced:
+            try:
+                flagged = flag_outreach_bounce(pc_conn, bounced)
+                log.info('bounce: extracted recipient=%s flagged=%s', bounced, flagged)
+            except Exception:
+                log.exception('bounce outreach flagging failed for %s', bounced)
+        else:
+            log.info('bounce: could not extract recipient from msg=%s', msg.get('id', ''))
+
+    with pc_conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO email_auto_closes
+              (company_id, gmail_msg_id, sender, subject, category, rule_matched, llm_used, issue_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::uuid)
+            """,
+            (
+                company_id,
+                msg.get('id', ''),
+                sender,
+                msg.get('subject', ''),
+                category,
+                rule_matched,
+                llm_used,
+                issue_id,
+            ),
+        )
+    pc_conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Keyword-based routing: after alias matching fails, scan subject + body for
@@ -439,8 +828,12 @@ class Customer:
 
 
 def lookup_customer(pc_conn: psycopg.Connection, sender_email: str, mailbox: str) -> Customer | None:
-    """Find an active customer by email; prefer the domain whose agent_mailbox
-    matches the inbound mailbox, else most recently updated."""
+    """Find an active customer by email or sender domain.
+
+    Pass 1: exact match on customers.email.
+    Pass 2: if no match, match sender domain against active domains rows.
+    Returns None if neither pass resolves.
+    """
     with pc_conn.cursor() as cur:
         cur.execute(
             """
@@ -457,8 +850,33 @@ def lookup_customer(pc_conn: psycopg.Connection, sender_email: str, mailbox: str
             (sender_email, mailbox),
         )
         row = cur.fetchone()
+    if row is not None:
+        return Customer(*row)
+
+    # Pass 2: domain alias fallback — sender is from a customer's registered domain.
+    sender_domain = sender_email.split("@")[-1] if "@" in sender_email else ""
+    if not sender_domain:
+        return None
+    with pc_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT c.id::text, c.email, c.name, c.business_name,
+                   d.fqdn, d.contabo_path
+            FROM customers c
+            JOIN domains d ON d.customer_id = c.id AND d.status = 'active'
+            WHERE LOWER(d.fqdn) = LOWER(%s)
+              AND c.status = 'active'
+            ORDER BY
+                (d.agent_mailbox = %s) DESC NULLS LAST,
+                d.updated_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            (sender_domain, mailbox),
+        )
+        row = cur.fetchone()
     if row is None:
         return None
+    log.info("lookup_customer: domain_alias_match=True sender=%s domain=%s customer_id=%s", sender_email, sender_domain, row[0])
     return Customer(*row)
 
 
@@ -494,29 +912,62 @@ def _internal_customer(sender_email: str) -> Customer:
 # ---------------------------------------------------------------------------
 
 
-def find_issue_by_thread(pc_conn: psycopg.Connection, company_id: str, thread_id: str) -> str | None:
-    """Find the most recent issue whose comments carry the given gmail_thread_id.
+def find_open_issues_by_sender(
+    pc_conn: psycopg.Connection, company_id: str, sender_email: str
+) -> list[tuple[str, str]]:
+    """Return (issue_id, identifier) list for open issues from sender_email, oldest first.
 
-    Returns the issue id string if found, else None. Includes done/cancelled
-    issues: a reply on a closed thread should reattach (and reopen) the
-    original issue rather than spawn a fresh ticket and lose the assignee.
-    The caller is responsible for reopening if status is terminal.
+    Matches on inbound_sender_email (normalized) or inbound_from (raw header).
     """
     with pc_conn.cursor() as cur:
         cur.execute(
             """
-            SELECT i.id::text
+            SELECT i.id::text, i.identifier
             FROM issues i
-            JOIN issue_comments ic ON ic.issue_id = i.id
-            WHERE ic.company_id = %s
-              AND ic.metadata->>'gmail_thread_id' = %s
-            ORDER BY i.created_at DESC
-            LIMIT 1
+            WHERE i.company_id = %s
+              AND i.status = ANY(%s)
+              AND EXISTS (
+                SELECT 1 FROM issue_comments ic
+                WHERE ic.issue_id = i.id
+                  AND ic.company_id = %s
+                  AND (
+                    LOWER(ic.metadata->>'inbound_sender_email') = %s
+                    OR ic.metadata->>'inbound_from' ILIKE %s
+                  )
+              )
+            ORDER BY i.updated_at DESC
             """,
-            (company_id, thread_id),
+            (company_id, _OPEN_STATUSES, company_id, sender_email.lower(), f"%{sender_email}%"),
         )
-        row = cur.fetchone()
-    return row[0] if row else None
+        return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def _thread_attach_body(sender: str, msg: dict, saved_attachments: list[dict] | None = None) -> tuple[str, dict]:
+    """Build (comment_body, metadata) for attaching a new email to an existing open issue."""
+    subject_line = (msg.get("subject") or "").strip()
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    header = f"**Inbound email from {sender} at {ts}** — Subject: {subject_line}"
+    body = f"{header}\n\n{(msg.get('body') or '').strip() or '(empty body)'}"
+    if saved_attachments:
+        lines = "\n".join(
+            f"- `{a['filename']}` ({a['mimeType']}, {a['size']} bytes) → `{a['path']}`"
+            for a in saved_attachments
+        )
+        body += f"\n\n**Attachments ({len(saved_attachments)}):**\n{lines}"
+    metadata: dict = {
+        "gmail_thread_id": msg.get("thread_id"),
+        "gmail_msg_id": msg.get("id"),
+        "inbound_subject": msg.get("subject"),
+        "inbound_from": msg.get("from"),
+        "inbound_sender_email": sender,
+        "thread_attach": True,
+    }
+    if saved_attachments:
+        metadata["attachments"] = [
+            {"path": a["path"], "filename": a["filename"], "mimeType": a["mimeType"]}
+            for a in saved_attachments
+        ]
+    return body, metadata
 
 
 def append_comment(
@@ -550,6 +1001,7 @@ def create_issue_for_email(
     suggested_route: dict | None = None,
     trusted_internal: bool = False,
     status: str = "todo",
+    origin_kind: str = "customer_email",
 ) -> tuple[str, str]:
     """Create a new `todo` issue for an inbound customer email.
 
@@ -598,11 +1050,11 @@ def create_issue_for_email(
                    %s::uuid,
                    'operator', bump.issue_counter,
                    bump.issue_prefix || '-' || bump.issue_counter,
-                   'customer_email', %s
+                   %s, %s
               FROM bump
             RETURNING id::text, identifier
             """,
-            (company_id, company_id, title, description, status, assignee_agent_id, msg.get("id") or ""),
+            (company_id, company_id, title, description, status, assignee_agent_id, origin_kind, msg.get("id") or ""),
         )
         issue_id, identifier = cur.fetchone()
 
@@ -611,6 +1063,7 @@ def create_issue_for_email(
         "gmail_msg_id": msg.get("id"),
         "inbound_subject": subject,
         "inbound_from": msg.get("from"),
+        "inbound_sender_email": email.utils.parseaddr(msg.get("from") or "")[1].lower().strip(),
         "trusted_internal": trusted_internal,
     }
     if suggested_route:
@@ -660,6 +1113,16 @@ def process_message(
     sender = parse_sender(msg["from"])
     sender_lc = sender.lower()
 
+    # Auto-close filter: catch machine-generated email before any queue work.
+    classification = classify_inbound(sender_lc, msg.get('subject', ''), msg.get('body', ''))
+    if classification is not None:
+        category, rule_matched = classification
+        llm_used = rule_matched.startswith('llm:')
+        log.info('auto-close: category=%s rule=%s msg=%s', category, rule_matched, msg_id)
+        if not dry_run:
+            auto_close_message(svc, pc_conn, pending_conn, cfg, company_id, msg, sender_lc, category, rule_matched, llm_used)
+        return {'action': 'auto_closed', 'category': category, 'rule_matched': rule_matched}
+
     # Loop guard FIRST: skip anything we previously forwarded back to ourselves.
     # Subject prefix is set by forward_to_operator; trumps all other gates.
     if msg["subject"].strip().startswith("[AIB forward]"):
@@ -691,6 +1154,32 @@ def process_message(
             issue_id = None
             identifier = None
             if not dry_run:
+                open_by_sender = find_open_issues_by_sender(pc_conn, company_id, sender)
+                if len(open_by_sender) == 1:
+                    target_issue_id, target_identifier = open_by_sender[0]
+                    forward_to_operator(svc, cfg.mailbox, cfg.operator_email, msg)
+                    saved_atts = save_attachments(svc, cfg.mailbox, msg["id"], target_issue_id, msg.get("attachments") or [])
+                    comment_body, meta = _thread_attach_body(sender, msg, saved_atts or None)
+                    meta["trusted_internal"] = False
+                    comment_id = append_comment(
+                        pc_conn, company_id=company_id, issue_id=target_issue_id,
+                        body=comment_body, metadata=meta, author_user_id="customer",
+                    )
+                    mark_read(svc, cfg.mailbox, msg_id)
+                    clear_pending(pending_conn, msg["id"])
+                    pc_conn.commit()
+                    log.info(
+                        "thread-attached unknown-sender email from %s onto %s",
+                        sender, target_identifier,
+                    )
+                    return {
+                        "action": "comment_appended",
+                        "issue_id": target_issue_id,
+                        "identifier": target_identifier,
+                        "comment_id": comment_id,
+                        "thread_attach": True,
+                        "attachments": saved_atts,
+                    }
                 forward_to_operator(svc, cfg.mailbox, cfg.operator_email, msg)
                 mark_read(svc, cfg.mailbox, msg_id)
                 record_pending(pending_conn, msg, "unknown_sender")
@@ -707,6 +1196,30 @@ def process_message(
                     assignee_agent_id=MERCER_AGENT_ID,
                     status="blocked",
                 )
+                saved_atts = save_attachments(svc, cfg.mailbox, msg["id"], issue_id, msg.get("attachments") or [])
+                if saved_atts:
+                    att_lines = "\n".join(
+                        f"- `{a['filename']}` ({a['mimeType']}, {a['size']} bytes) → `{a['path']}`"
+                        for a in saved_atts
+                    )
+                    append_comment(
+                        pc_conn, company_id=company_id, issue_id=issue_id,
+                        body=f"**Attachments ({len(saved_atts)}):**\n{att_lines}",
+                        metadata={"attachments": [{"path": a["path"], "filename": a["filename"], "mimeType": a["mimeType"]} for a in saved_atts]},
+                        author_user_id="customer",
+                    )
+                if len(open_by_sender) > 1:
+                    oldest_id, oldest_identifier = open_by_sender[0]
+                    append_comment(
+                        pc_conn, company_id=company_id, issue_id=oldest_id,
+                        body=(
+                            f"**Related thread opened as {identifier}.**\n"
+                            f"Another email from {sender} arrived. "
+                            f"Check {identifier} — Mercer can merge if it's the same conversation."
+                        ),
+                        metadata={"system": True, "related_issue": issue_id},
+                        author_user_id="customer",
+                    )
                 pc_conn.commit()
             return {
                 "action": "unknown_sender",
@@ -715,63 +1228,71 @@ def process_message(
                 "identifier": identifier,
             }
 
-    # Known sender — look for an existing open issue on this thread.
-    existing_issue_id = find_issue_by_thread(pc_conn, company_id, msg.get("thread_id") or "")
+    # Known sender — route purely on (sender, open DIS). gmail thread_id is
+    # stored in comment metadata for forensics only; it is never a routing key.
+    open_by_sender = find_open_issues_by_sender(pc_conn, company_id, sender)
 
-    if existing_issue_id is not None:
-        # Append comment.
-        metadata = {
-            "gmail_thread_id": msg.get("thread_id"),
-            "gmail_msg_id": msg.get("id"),
-            "inbound_subject": msg.get("subject"),
-            "inbound_from": msg.get("from"),
-            "trusted_internal": trusted_internal,
-        }
+    if len(open_by_sender) == 1:
+        target_issue_id, target_identifier = open_by_sender[0]
+        saved_atts = save_attachments(svc, cfg.mailbox, msg["id"], target_issue_id, msg.get("attachments") or [], dry_run=dry_run)
+        comment_body, meta = _thread_attach_body(sender, msg, saved_atts or None)
+        meta["trusted_internal"] = trusted_internal
         comment_id = append_comment(
-            pc_conn,
-            company_id=company_id,
-            issue_id=existing_issue_id,
-            body=(msg.get("body") or "").strip() or "(empty body)",
-            metadata=metadata,
-            author_user_id="customer",
+            pc_conn, company_id=company_id, issue_id=target_issue_id,
+            body=comment_body, metadata=meta, author_user_id="customer",
         )
-
-        # If the matched issue is terminal (done/cancelled), reopen it so the
-        # original assignee picks up the follow-up rather than losing context.
-        with pc_conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE issues
-                   SET status = 'todo', completed_at = NULL, updated_at = now()
-                 WHERE id = %s AND status IN ('done', 'cancelled')
-                RETURNING id
-                """,
-                (existing_issue_id,),
-            )
-            reopened = cur.fetchone() is not None
-        if reopened:
-            append_comment(
-                pc_conn,
-                company_id=company_id,
-                issue_id=existing_issue_id,
-                body="(reopened — follow-up received on closed thread)",
-                metadata={"system": True, "reopened": True},
-                author_user_id="customer",
-            )
-            log.info("reopened %s due to follow-up on closed thread", existing_issue_id)
         pc_conn.commit()
-        identifier = get_identifier(pc_conn, existing_issue_id)
-        log.info("appended comment to %s for sender=%s", identifier, sender)
-
+        log.info("appended email from %s onto %s", sender, target_identifier)
         if not dry_run:
             mark_read(svc, cfg.mailbox, msg_id)
             clear_pending(pending_conn, msg["id"])
-
         return {
             "action": "comment_appended",
-            "issue_id": existing_issue_id,
-            "identifier": identifier,
+            "issue_id": target_issue_id,
+            "identifier": target_identifier,
             "comment_id": comment_id,
+            "thread_attach": True,
+            "attachments": saved_atts,
+        }
+
+    if len(open_by_sender) > 1:
+        # Multiple open issues: attach to most-recently-updated, post a conflict
+        # note on each of the others so Paulina / the assignee can merge or close.
+        target_issue_id, target_identifier = open_by_sender[0]
+        saved_atts = save_attachments(svc, cfg.mailbox, msg["id"], target_issue_id, msg.get("attachments") or [], dry_run=dry_run)
+        comment_body, meta = _thread_attach_body(sender, msg, saved_atts or None)
+        meta["trusted_internal"] = trusted_internal
+        comment_id = append_comment(
+            pc_conn, company_id=company_id, issue_id=target_issue_id,
+            body=comment_body, metadata=meta, author_user_id="customer",
+        )
+        for conflict_id, conflict_identifier in open_by_sender[1:]:
+            append_comment(
+                pc_conn, company_id=company_id, issue_id=conflict_id,
+                body=(
+                    f"**Routing conflict:** new email from {sender} arrived while "
+                    f"this issue was open and was attached to {target_identifier} "
+                    f"(most recently updated). Merge or close as appropriate."
+                ),
+                metadata={"system": True, "conflict_target": target_issue_id},
+                author_user_id="customer",
+            )
+        pc_conn.commit()
+        log.info(
+            "multi-open: attached email from %s to %s; flagged %d other(s)",
+            sender, target_identifier, len(open_by_sender) - 1,
+        )
+        if not dry_run:
+            mark_read(svc, cfg.mailbox, msg_id)
+            clear_pending(pending_conn, msg["id"])
+        return {
+            "action": "comment_appended",
+            "issue_id": target_issue_id,
+            "identifier": target_identifier,
+            "comment_id": comment_id,
+            "thread_attach": True,
+            "conflict_count": len(open_by_sender) - 1,
+            "attachments": saved_atts,
         }
 
     # No existing thread -> new issue.
@@ -816,6 +1337,18 @@ def process_message(
         suggested_route=suggested_route,
         trusted_internal=trusted_internal,
     )
+    saved_atts = save_attachments(svc, cfg.mailbox, msg["id"], issue_id, msg.get("attachments") or [], dry_run=dry_run)
+    if saved_atts:
+        att_lines = "\n".join(
+            f"- `{a['filename']}` ({a['mimeType']}, {a['size']} bytes) → `{a['path']}`"
+            for a in saved_atts
+        )
+        append_comment(
+            pc_conn, company_id=company_id, issue_id=issue_id,
+            body=f"**Attachments ({len(saved_atts)}):**\n{att_lines}",
+            metadata={"attachments": [{"path": a["path"], "filename": a["filename"], "mimeType": a["mimeType"]} for a in saved_atts]},
+            author_user_id="customer",
+        )
     pc_conn.commit()
     log.info("created issue %s for sender=%s subject=%r", identifier, sender, msg.get("subject"))
 
@@ -828,6 +1361,7 @@ def process_message(
         "issue_id": issue_id,
         "identifier": identifier,
         "suggested_route": suggested_route,
+        "attachments": saved_atts,
     }
 
 
@@ -850,8 +1384,14 @@ def main() -> int:
     with psycopg.connect(cfg.dsn) as pending_conn, psycopg.connect(pc_dsn) as pc_conn:
         svc = gmail_client(cfg.sa_path, cfg.mailbox)
 
+        # Snapshot known customer emails so unknown_sender retries only fire
+        # for senders who have since been added to the customers table.
+        with pc_conn.cursor() as cur:
+            cur.execute("SELECT LOWER(email) FROM customers WHERE status = 'active'")
+            known_emails: set[str] = {row[0] for row in cur.fetchall()}
+
         # Retry pending emails first.
-        for msg_id, _ in fetch_pending_due(pending_conn):
+        for msg_id, _ in fetch_pending_due(pending_conn, known_customer_emails=known_emails):
             try:
                 log.info("retrying pending email %s", msg_id)
                 process_message(svc, pending_conn, pc_conn, cfg, company_id, msg_id,

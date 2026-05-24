@@ -46,7 +46,7 @@ subprocess. After aider returns it's back to plumbing.
 | Language | Python 3, stdlib + `google-api-python-client` + `psycopg[binary]` + `requests` |
 | LLM harness | [`aider`](https://aider.chat) invoked as a subprocess |
 | Inference | Ollama cloud (`ollama signin`, model `kimi-k2.6:cloud`) — proxied through the local `ollama` daemon |
-| Mailbox | Google Workspace + Gmail API, SA with domain-wide delegation for `gmail.modify` |
+| Mailbox | Google Workspace + Gmail API, SA with domain-wide delegation for `https://mail.google.com/` |
 | Customer-domain mail | Namecheap email-forwarding (`*@customerdomain.com` → customer's personal inbox) |
 | Web serving | Caddy on a single VPS (Contabo or wherever) |
 | State | One Postgres database, one table |

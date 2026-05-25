@@ -577,6 +577,82 @@ def extract_bounce_recipient(subject: str, body: str, delivery_status: str = "")
     return None
 
 
+_DSN_STATUS_RE = re.compile(r'Status:\s*(\d\.\d+\.\d+)', re.I)
+_DSN_DIAGNOSTIC_RE = re.compile(r'Diagnostic-Code:\s*smtp;\s*(\d{3})\b', re.I)
+
+
+def extract_dsn_status(delivery_status: str, body: str = "") -> tuple[str | None, bool]:
+    """Parse the DSN status code from delivery-status or body text.
+
+    Returns (status_code, is_permanent).  is_permanent is True for 5xx,
+    False for 4xx.  Returns (None, False) if no code found.
+    """
+    search_text = f"{delivery_status}\n{body}"
+    m = _DSN_STATUS_RE.search(search_text)
+    if m:
+        code = m.group(1)
+        return code, code.startswith("5")
+    m = _DSN_DIAGNOSTIC_RE.search(search_text)
+    if m:
+        smtp_code = m.group(1)
+        return smtp_code, smtp_code.startswith("5")
+    return None, False
+
+
+_OPS_DSN = os.environ.get(
+    "OPS_DSN",
+    "postgresql:///discnxt_ops",
+)
+
+
+def _record_bounce_suppression(
+    bounced_email: str, status_code: str | None, is_permanent: bool
+) -> None:
+    """Write a suppression row to discnxt_ops.email_suppressions.
+
+    4xx → domain suppression for 24h.  5xx → permanent address suppression.
+    No status code → domain suppression for 24h (safe default).
+    """
+    domain = bounced_email.rsplit("@", 1)[-1].lower() if "@" in bounced_email else ""
+    if is_permanent:
+        target, scope = bounced_email.lower(), "address"
+        reason = f"hard bounce ({status_code or 'unknown'})"
+        expires = None
+    else:
+        target, scope = domain, "domain"
+        reason = f"transient bounce ({status_code or 'unknown'})"
+        expires = "now() + interval '24 hours'"
+
+    try:
+        with psycopg.connect(_OPS_DSN) as conn:
+            with conn.cursor() as cur:
+                if expires:
+                    cur.execute(
+                        """
+                        INSERT INTO email_suppressions
+                            (address_or_domain, scope, reason, status_code, expires_at)
+                        VALUES (%s, %s, %s, %s, now() + interval '24 hours')
+                        """,
+                        (target, scope, reason, status_code),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO email_suppressions
+                            (address_or_domain, scope, reason, status_code, expires_at)
+                        VALUES (%s, %s, %s, %s, NULL)
+                        """,
+                        (target, scope, reason, status_code),
+                    )
+            conn.commit()
+        log.info(
+            "bounce suppression: %s scope=%s reason=%s permanent=%s",
+            target, scope, reason, is_permanent,
+        )
+    except Exception:
+        log.exception("failed to record bounce suppression for %s", bounced_email)
+
+
 def flag_outreach_bounce(pc_conn: psycopg.Connection, bounced_email: str) -> bool:
     """Mark a lead and its most-recent sent contact_attempt as bounced.
 
@@ -668,7 +744,7 @@ def auto_close_message(
     )
     mark_read(svc, cfg.mailbox, msg['id'])
 
-    # For bounces: extract the failed recipient and flag the outreach DB.
+    # For bounces: extract the failed recipient, flag CRM, record suppression.
     if category == 'bounce':
         bounced = extract_bounce_recipient(
             msg.get('subject', ''),
@@ -681,6 +757,15 @@ def auto_close_message(
                 log.info('bounce: extracted recipient=%s flagged=%s', bounced, flagged)
             except Exception:
                 log.exception('bounce outreach flagging failed for %s', bounced)
+
+            # Record suppression based on DSN status code
+            try:
+                status_code, is_permanent = extract_dsn_status(
+                    msg.get('delivery_status', ''), msg.get('body', ''),
+                )
+                _record_bounce_suppression(bounced, status_code, is_permanent)
+            except Exception:
+                log.exception('bounce suppression recording failed for %s', bounced)
         else:
             log.info('bounce: could not extract recipient from msg=%s', msg.get('id', ''))
 

@@ -30,7 +30,7 @@ import threading
 
 import psycopg2
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from aib.crm.outreach import log_outreach
 
 log = logging.getLogger("aib.send_email")
@@ -168,7 +168,8 @@ def _build_raw(
 
 
 def send(
-    issue_id: str,
+    *,
+    issue_id: str | None = None,
     subject: str,
     body: str,
     to: str | None = None,
@@ -220,7 +221,7 @@ def send(
             "DRY RUN send issue=%s to=%s subject=%r (Gmail skipped)",
             issue_id, recipient, subject,
         )
-        return f"DRY_RUN_{issue_id[:8]}"
+        return f"DRY_RUN_{issue_id[:8] if issue_id else 'NOID'}"
 
     # --- Suppression check: skip send if recipient/domain is suppressed ---
     suppression = is_suppressed(recipient)
@@ -230,7 +231,7 @@ def send(
             issue_id, recipient, suppression["reason"],
             suppression["scope"], suppression.get("expires_at"),
         )
-        return f"SUPPRESSED_{issue_id[:8]}"
+        return f"SUPPRESSED_{issue_id[:8] if issue_id else 'NOID'}"
 
     # --- Per-domain throttle: sleep if we recently sent to this domain ---
     domain = _extract_domain(recipient)
@@ -248,22 +249,23 @@ def send(
     log.info("sent email issue=%s gmail_id=%s to=%s", issue_id, gmail_msg_id, recipient)
 
     with psycopg2.connect(_DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO issue_comments (issue_id, company_id, body, created_at)
-                VALUES (%s, %s, %s, now())
-                """,
-                (
-                    issue_id,
-                    '3f6ac8c4-e9ec-4fd3-b644-b7cb5d15bfa6',
-                    f"[send_email] Sent to {recipient} | gmail_id={gmail_msg_id}",
-                ),
-            )
-            cur.execute(
-                "UPDATE issues SET status = %s, updated_at = now() WHERE id = %s",
-                (status_after, issue_id),
-            )
+        if issue_id:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO issue_comments (issue_id, company_id, body, created_at)
+                    VALUES (%s, %s, %s, now())
+                    """,
+                    (
+                        issue_id,
+                        '3f6ac8c4-e9ec-4fd3-b644-b7cb5d15bfa6',
+                        f"[send_email] Sent to {recipient} | gmail_id={gmail_msg_id}",
+                    ),
+                )
+                cur.execute(
+                    "UPDATE issues SET status = %s, updated_at = now() WHERE id = %s",
+                    (status_after, issue_id),
+                )
 
         if lead_id:
             log_outreach(
